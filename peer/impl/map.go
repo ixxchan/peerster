@@ -28,6 +28,14 @@ func (m *ConcurrentMap) Set(key, value string) {
 	m.m[key] = value
 }
 
+// if key does not exist, return ""
+func (m *ConcurrentMap) Get(key string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.m[key]
+}
+
 func (m *ConcurrentMap) Delete(key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

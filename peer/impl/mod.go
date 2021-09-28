@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog"
 	"go.dedis.ch/cs438/peer"
 	"go.dedis.ch/cs438/transport"
+	"go.dedis.ch/cs438/types"
 )
+
+const TIMEOUT = time.Second * 1
 
 // NewPeer creates a new peer. You can change the content and location of this
 // function but you MUST NOT change its signature and package location.
@@ -17,6 +21,17 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 		done:         make(chan struct{}, 1),
 		routingTable: NewConcurrentMap(),
 	}
+	node.logger = Logger.With().Str("node", node.getAddr()).Logger()
+
+	conf.MessageRegistry.RegisterMessageCallback(
+		types.ChatMessage{},
+		func(m types.Message, p transport.Packet) error {
+			node.logger.Info().
+				Str("source", p.Header.Source).
+				Str("packet_id", p.Header.PacketID).
+				Msgf("received chat message: %v", m.String())
+			return nil
+		})
 
 	// routingTable[myAddr] = myAddr
 	node.AddPeer(conf.Socket.GetAddress())
@@ -31,6 +46,8 @@ type node struct {
 	routingTable ConcurrentMap
 
 	done chan struct{}
+
+	logger zerolog.Logger
 }
 
 // Start implements peer.Service
@@ -42,13 +59,30 @@ func (n *node) Start() error {
 				continue
 			}
 			if err != nil {
-				Logger.Warn().Msgf("error when receive packet: %v", err)
+				n.logger.Warn().Msgf("error when receive packet: %v", err)
 			}
 
-			Logger.Info().
+			n.logger.Info().
 				Str("source", pkt.Header.Source).
+				Str("destination", pkt.Header.Destination).
 				Str("packet_id", pkt.Header.PacketID).
 				Msgf("received packet")
+			if pkt.Header.Destination != n.getAddr() {
+				nextHop := n.routingTable.Get(pkt.Header.Destination)
+				if nextHop == "" {
+					n.logger.Info().Msgf("unknown relay destination: %v", pkt.Header.Destination)
+				} else {
+					n.logger.Info().
+						Str("source", pkt.Header.Source).
+						Str("destination", pkt.Header.Destination).
+						Str("packet_id", pkt.Header.PacketID).
+						Msgf("relay packet")
+					pkt.Header.RelayedBy = n.getAddr()
+					n.conf.Socket.Send(nextHop, pkt, TIMEOUT)
+				}
+			} else {
+				n.conf.MessageRegistry.ProcessPacket(pkt)
+			}
 
 			select {
 			case <-n.done:
@@ -73,7 +107,18 @@ func (n *node) Stop() error {
 
 // Unicast implements peer.Messaging
 func (n *node) Unicast(dest string, msg transport.Message) error {
-	panic("to be implemented in HW0")
+	nextHop := n.routingTable.Get(dest)
+	if nextHop == "" {
+		return fmt.Errorf("unknown dest: %v", dest)
+	}
+
+	hdr := transport.NewHeader(n.getAddr(), n.getAddr(), dest, 0)
+	pkt := transport.Packet{
+		Msg:    &msg,
+		Header: &hdr,
+	}
+
+	return n.conf.Socket.Send(nextHop, pkt, TIMEOUT)
 }
 
 // AddPeer implements peer.Service
@@ -95,4 +140,8 @@ func (n *node) SetRoutingEntry(origin, relayAddr string) {
 	} else {
 		n.routingTable.Set(origin, relayAddr)
 	}
+}
+
+func (n *node) getAddr() string {
+	return n.conf.Socket.GetAddress()
 }
