@@ -3,24 +3,11 @@ package impl
 import (
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
-	"github.com/rs/zerolog"
 	"go.dedis.ch/cs438/peer"
 	"go.dedis.ch/cs438/transport"
 )
-
-const defaultLevel = zerolog.NoLevel
-
-var logout = zerolog.ConsoleWriter{
-	Out:        os.Stdout,
-	TimeFormat: time.RFC3339,
-}
-
-var Logger = zerolog.New(logout).Level(defaultLevel).
-	With().Timestamp().Logger().
-	With().Caller().Logger()
 
 // NewPeer creates a new peer. You can change the content and location of this
 // function but you MUST NOT change its signature and package location.
