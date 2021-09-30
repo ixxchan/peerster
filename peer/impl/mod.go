@@ -3,6 +3,7 @@ package impl
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -12,7 +13,43 @@ import (
 	"go.dedis.ch/cs438/types"
 )
 
-const TIMEOUT = time.Second * 1
+// envLogLevel is the name of the environment variable to change the logging
+// level.
+//
+//   NODELOG=trace go test ./...
+//   NODELOG=info go test ./...
+//
+const envLogLevel = "NODELOG"
+
+const defaultLevel = zerolog.InfoLevel
+
+var level = defaultLevel
+
+func init() {
+	switch os.Getenv(envLogLevel) {
+	case "error":
+		level = zerolog.ErrorLevel
+	case "warn":
+		level = zerolog.WarnLevel
+	case "info":
+		level = zerolog.InfoLevel
+	case "debug":
+		level = zerolog.DebugLevel
+	case "trace":
+		level = zerolog.TraceLevel
+	case "":
+		level = defaultLevel
+	default:
+		level = zerolog.TraceLevel
+	}
+}
+
+var logout = zerolog.ConsoleWriter{
+	Out:        os.Stdout,
+	TimeFormat: time.RFC3339,
+}
+
+const timeout = time.Second * 1
 
 // NewPeer creates a new peer. You can change the content and location of this
 // function but you MUST NOT change its signature and package location.
@@ -22,8 +59,11 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 		done:         make(chan struct{}, 1),
 		routingTable: NewConcurrentMap(),
 	}
-	node.logger = Logger.With().Str("node", node.getAddr()).Logger()
-
+	node.logger = zerolog.New(logout).Level(level).With().
+		Timestamp().
+		Caller().
+		Str("role", "node").
+		Str("myaddr", node.getAddr()).Logger()
 	conf.MessageRegistry.RegisterMessageCallback(
 		types.ChatMessage{},
 		func(m types.Message, p transport.Packet) error {
@@ -60,7 +100,13 @@ func (n *node) Start() error {
 				continue
 			}
 			if err != nil {
-				n.logger.Warn().Msgf("error when receive packet: %v", err)
+				select {
+				case <-n.done:
+					return
+				default:
+					n.logger.Warn().Msgf("error when receive packet: %v", err)
+					continue
+				}
 			}
 
 			n.logger.Info().
@@ -79,7 +125,7 @@ func (n *node) Start() error {
 						Str("packet_id", pkt.Header.PacketID).
 						Msgf("relay packet")
 					pkt.Header.RelayedBy = n.getAddr()
-					n.conf.Socket.Send(nextHop, pkt, TIMEOUT)
+					n.conf.Socket.Send(nextHop, pkt, timeout)
 				}
 			} else {
 				n.conf.MessageRegistry.ProcessPacket(pkt)
@@ -120,7 +166,7 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 		Header: &hdr,
 	}
 
-	return n.conf.Socket.Send(nextHop, pkt, TIMEOUT)
+	return n.conf.Socket.Send(nextHop, pkt, timeout)
 }
 
 // AddPeer implements peer.Service
