@@ -3,6 +3,7 @@ package impl
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -107,6 +108,7 @@ func (n *node) Stop() error {
 
 // Unicast implements peer.Messaging
 func (n *node) Unicast(dest string, msg transport.Message) error {
+	dest = strings.TrimSpace(dest)
 	nextHop := n.routingTable.Get(dest)
 	if nextHop == "" {
 		return fmt.Errorf("unknown dest: %v", dest)
@@ -135,6 +137,8 @@ func (n *node) GetRoutingTable() peer.RoutingTable {
 
 // SetRoutingEntry implements peer.Service
 func (n *node) SetRoutingEntry(origin, relayAddr string) {
+	origin = strings.TrimSpace(origin)
+	relayAddr = strings.TrimSpace(relayAddr)
 	if relayAddr == "" {
 		n.routingTable.Delete(origin)
 	} else {
