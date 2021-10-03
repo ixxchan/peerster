@@ -109,26 +109,30 @@ func (n *node) Start() error {
 				}
 			}
 
-			n.logger.Info().
+			pktLogger := n.logger.With().
 				Str("source", pkt.Header.Source).
 				Str("destination", pkt.Header.Destination).
-				Str("packet_id", pkt.Header.PacketID).
-				Msgf("received packet")
+				Str("packet_id", pkt.Header.PacketID).Logger()
+			pktLogger.Info().Msgf("received packet")
 			if pkt.Header.Destination != n.getAddr() {
 				nextHop := n.routingTable.Get(pkt.Header.Destination)
 				if nextHop == "" {
 					n.logger.Info().Msgf("unknown relay destination: %v", pkt.Header.Destination)
 				} else {
-					n.logger.Info().
-						Str("source", pkt.Header.Source).
-						Str("destination", pkt.Header.Destination).
-						Str("packet_id", pkt.Header.PacketID).
-						Msgf("relay packet")
+					pktLogger.Info().Msgf("relay packet")
 					pkt.Header.RelayedBy = n.getAddr()
-					n.conf.Socket.Send(nextHop, pkt, timeout)
+					go func() {
+						if err := n.conf.Socket.Send(nextHop, pkt, timeout); err != nil {
+							pktLogger.Info().Msgf("error when send packet: %v", err)
+						}
+					}()
 				}
 			} else {
-				n.conf.MessageRegistry.ProcessPacket(pkt)
+				go func() {
+					if err := n.conf.MessageRegistry.ProcessPacket(pkt); err != nil {
+						pktLogger.Info().Msgf("error when process packet: %v", err)
+					}
+				}()
 			}
 
 			select {
