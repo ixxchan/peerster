@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.dedis.ch/cs438/peer"
+	"go.dedis.ch/cs438/registry"
 	"go.dedis.ch/cs438/transport"
 	"go.dedis.ch/cs438/types"
 )
@@ -64,15 +65,13 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 		Caller().
 		Str("role", "node").
 		Str("myaddr", node.getAddr()).Logger()
-	conf.MessageRegistry.RegisterMessageCallback(
-		types.ChatMessage{},
-		func(m types.Message, p transport.Packet) error {
-			node.logger.Info().
-				Str("source", p.Header.Source).
-				Str("packet_id", p.Header.PacketID).
-				Msgf("received chat message: %v", m.String())
-			return nil
-		})
+
+	conf.MessageRegistry.RegisterMessageCallback(types.ChatMessage{}, logging(&node.logger)(chatHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.RumorsMessage{}, logging(&node.logger)(rumorsHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.StatusMessage{}, logging(&node.logger)(statusHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.AckMessage{}, logging(&node.logger)(ackHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.EmptyMessage{}, logging(&node.logger)(emptyHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.PrivateMessage{}, logging(&node.logger)(privateHandler))
 
 	// routingTable[myAddr] = myAddr
 	node.AddPeer(conf.Socket.GetAddress())
@@ -173,6 +172,11 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 	return n.conf.Socket.Send(nextHop, pkt, timeout)
 }
 
+// Broadcast implements peer.Messaging
+func (n *node) Broadcast(msg transport.Message) error {
+	panic("not implemeted")
+}
+
 // AddPeer implements peer.Service
 func (n *node) AddPeer(addr ...string) {
 	for _, addr := range addr {
@@ -198,4 +202,18 @@ func (n *node) SetRoutingEntry(origin, relayAddr string) {
 
 func (n *node) getAddr() string {
 	return n.conf.Socket.GetAddress()
+}
+
+// logging is a utility function that adds logging in a handler
+func logging(logger *zerolog.Logger) func(registry.Exec) registry.Exec {
+	return func(next registry.Exec) registry.Exec {
+		return func(m types.Message, p transport.Packet) error {
+			logger.Info().
+				Str("source", p.Header.Source).
+				Str("packet_id", p.Header.PacketID).
+				Str("message_type", m.Name()).
+				Msgf("process message: %v", m.String())
+			return next(m, p)
+		}
+	}
 }
