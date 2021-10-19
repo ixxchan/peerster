@@ -65,7 +65,6 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 		conf:         conf,
 		routingTable: NewConcurrentMap(),
 		status:       make(map[string]uint),
-		ackCh:        make(map[string]chan struct{}),
 		rumorsLog:    make(map[string][]types.Rumor),
 
 		ctx:        ctx,
@@ -163,8 +162,11 @@ type node struct {
 	// protect status & rumorsLog
 	rumorsMu sync.Mutex
 
-	// key: PacketID
-	ackCh map[string]chan struct{}
+	// PacketID -> chan struct{}
+	//
+	// This is used in Broadcast() and ackHandler().
+	// They do not require rumorsMu, and accessing the whole map is not needed, so simply use sync.Map.
+	ackCh sync.Map
 
 	ctx        context.Context
 	cancelFunc context.CancelFunc
@@ -289,7 +291,7 @@ func (n *node) Broadcast(msg transport.Message) error {
 	pkt.Header = &hdr
 
 	ackCh := make(chan struct{}, 1)
-	n.ackCh[pkt.Header.PacketID] = ackCh
+	n.ackCh.Store(pkt.Header.PacketID, ackCh)
 
 	if err := n.conf.Socket.Send(neighbor, pkt, timeout); err != nil {
 		return fmt.Errorf("failed to send rumor: %v", err)
@@ -324,7 +326,7 @@ func (n *node) Broadcast(msg transport.Message) error {
 					pkt.Header = &hdr
 
 					ackCh := make(chan struct{}, 1)
-					n.ackCh[pkt.Header.PacketID] = ackCh
+					n.ackCh.Store(pkt.Header.PacketID, ackCh)
 
 					if err := n.conf.Socket.Send(neighbor, pkt, timeout); err != nil {
 						n.logger.Error().Msgf("failed to send rumor: %v", err)

@@ -171,14 +171,19 @@ func (c *controller) statusHandler(m types.Message, p transport.Packet) error {
 
 func (c *controller) ackHandler(m types.Message, p transport.Packet) error {
 	ack := m.(*types.AckMessage)
-	// Each packet should only be acked once
-	select {
-	case c.node.ackCh[ack.AckedPacketID] <- struct{}{}:
-		close(c.node.ackCh[ack.AckedPacketID])
-		delete(c.node.ackCh, ack.AckedPacketID)
-		c.node.logger.Debug().Msgf("ack %v received", ack.AckedPacketID)
-	default:
-		c.node.logger.Warn().Str("packet_id", ack.AckedPacketID).Msgf("blocking ack")
+	value, ok := c.node.ackCh.Load(ack.AckedPacketID)
+	// When statusHandler sends missing rumor, the node is not waiting for ack
+	if ok {
+		// Each packet should only be acked once
+		ackCh := value.(chan struct{})
+		select {
+		case ackCh <- struct{}{}:
+			close(ackCh)
+			c.node.ackCh.Delete(ack.AckedPacketID)
+			c.node.logger.Debug().Msgf("ack %v received", ack.AckedPacketID)
+		default:
+			c.node.logger.Warn().Str("packet_id", ack.AckedPacketID).Msgf("blocking ack")
+		}
 	}
 
 	newPkt := transport.Packet{
