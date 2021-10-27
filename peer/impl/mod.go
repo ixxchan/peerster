@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,10 +28,16 @@ import (
 //   NODELOG=info go test ./...
 //
 const envLogLevel = "NODELOG"
+const envLogFile = "NODELOG_FILE"
 
 const defaultLevel = zerolog.Disabled
 
 var level = defaultLevel
+
+var logout io.Writer = zerolog.ConsoleWriter{
+	Out:        os.Stdout,
+	TimeFormat: time.RFC3339,
+}
 
 func init() {
 	switch os.Getenv(envLogLevel) {
@@ -47,14 +56,19 @@ func init() {
 	default:
 		level = zerolog.TraceLevel
 	}
+	logfile := os.Getenv(envLogFile)
+	if logfile != "" {
+		f, err := os.Create(logfile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "failed to open logfile", err)
+		} else {
+			logout = f
+			os.Stdout = f
+		}
+	}
 }
 
-var logout = zerolog.ConsoleWriter{
-	Out:        os.Stdout,
-	TimeFormat: time.RFC3339,
-}
-
-const timeout = time.Second * 1
+const SocketTimeout = time.Second * 1
 
 // NewPeer creates a new peer. You can change the content and location of this
 // function but you MUST NOT change its signature and package location.
@@ -127,6 +141,25 @@ func (ns *neighbors) getRandom() string {
 	return ns.data[rand.Intn(len(ns.data))]
 }
 
+func (ns *neighbors) getNewRandom(oldNeighbor string) string {
+	ns.RLock()
+	defer ns.RUnlock()
+
+	for {
+		neighbor := ns.data[rand.Intn(len(ns.data))]
+		if neighbor != oldNeighbor {
+			return neighbor
+		}
+	}
+}
+
+func (ns *neighbors) hasOnly(neighbor string) bool {
+	ns.Lock()
+	defer ns.Unlock()
+
+	return len(ns.data) == 1 && ns.data[0] == neighbor
+}
+
 func (ns *neighbors) has(neighbor string) bool {
 	ns.Lock()
 	defer ns.Unlock()
@@ -156,8 +189,7 @@ type node struct {
 	// node has processed so far.
 	//
 	// map peer -> the sequence number of the last Rumor processed from that peer.
-	status map[string]uint
-	// TODO: what about store Msg only?
+	status    map[string]uint
 	rumorsLog map[string][]types.Rumor
 	// protect status & rumorsLog
 	rumorsMu sync.Mutex
@@ -185,50 +217,40 @@ func (n *node) Start() error {
 	n.logger.Info().Msgf("starting ...")
 	go func() {
 		for {
-			pkt, err := n.conf.Socket.Recv(time.Second * 1)
-			if errors.Is(err, transport.TimeoutErr(0)) {
-				continue
+			select {
+			case <-n.ctx.Done():
+				return
+			default:
 			}
+
+			pkt, err := n.conf.Socket.Recv(time.Second * 1)
 			if err != nil {
-				select {
-				case <-n.ctx.Done():
-					return
-				default:
+				if !errors.Is(err, transport.TimeoutErr(0)) {
 					n.logger.Warn().Msgf("error when receive packet: %v", err)
-					continue
 				}
+				continue
 			}
 
 			pktLogger := n.logger.With().
 				Str("source", pkt.Header.Source).
 				Str("destination", pkt.Header.Destination).
 				Str("packet_id", pkt.Header.PacketID).Logger()
-			pktLogger.Info().Msgf("received packet")
+			pktLogger.Trace().Msgf("received packet")
 			if pkt.Header.Destination != n.getAddr() {
 				nextHop := n.routingTable.Get(pkt.Header.Destination)
 				if nextHop == "" {
-					n.logger.Info().Msgf("unknown relay destination: %v", pkt.Header.Destination)
+					n.logger.Debug().Msgf("unknown relay destination: %v", pkt.Header.Destination)
 				} else {
-					pktLogger.Info().Msgf("relay packet")
+					pktLogger.Trace().Msgf("relay packet")
 					pkt.Header.RelayedBy = n.getAddr()
 					go func() {
-						if err := n.conf.Socket.Send(nextHop, pkt, timeout); err != nil {
-							pktLogger.Info().Msgf("error when send packet: %v", err)
+						if err := n.conf.Socket.Send(nextHop, pkt, SocketTimeout); err != nil {
+							pktLogger.Trace().Msgf("error when send packet: %v", err)
 						}
 					}()
 				}
 			} else {
-				go func() {
-					if err := n.conf.MessageRegistry.ProcessPacket(pkt); err != nil {
-						pktLogger.Info().Msgf("error when process packet: %v", err)
-					}
-				}()
-			}
-
-			select {
-			case <-n.ctx.Done():
-				return
-			default:
+				go n.conf.MessageRegistry.ProcessPacket(pkt)
 			}
 		}
 	}()
@@ -256,17 +278,16 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 		Header: &hdr,
 	}
 
-	return n.conf.Socket.Send(nextHop, pkt, timeout)
+	return n.conf.Socket.Send(nextHop, pkt, SocketTimeout)
 }
 
 // Broadcast implements peer.Messaging
 func (n *node) Broadcast(msg transport.Message) error {
-	// TODO: If error occurs, do we need to decrement?
-	atomic.AddUint32(&n.seq, 1)
+	seq := atomic.AddUint32(&n.seq, 1)
 	rumors := types.RumorsMessage{Rumors: []types.Rumor{
 		{
 			Origin:   n.getAddr(),
-			Sequence: uint(atomic.LoadUint32(&n.seq)),
+			Sequence: uint(seq),
 			Msg:      &msg,
 		},
 	}}
@@ -278,12 +299,14 @@ func (n *node) Broadcast(msg transport.Message) error {
 		Msg:    n.getMarshalledMsg(&rumors),
 	}
 	if err := n.conf.MessageRegistry.ProcessPacket(pkt); err != nil {
+		// Restore to the state before the operation
+		atomic.StoreUint32(&n.seq, seq-1)
 		return fmt.Errorf("failed to process rumor locally: %v", err)
 	}
 
 	// sends the rumor to a random neighbor.
 	if n.neighbors.len() == 0 {
-		n.logger.Warn().Msgf("has none neighbors")
+		n.logger.Warn().Msgf("has none neighbors to broadcast")
 		return nil
 	}
 	neighbor := n.neighbors.getRandom()
@@ -293,46 +316,51 @@ func (n *node) Broadcast(msg transport.Message) error {
 	ackCh := make(chan struct{}, 1)
 	n.ackCh.Store(pkt.Header.PacketID, ackCh)
 
-	if err := n.conf.Socket.Send(neighbor, pkt, timeout); err != nil {
+	if err := n.conf.Socket.Send(neighbor, pkt, SocketTimeout); err != nil {
 		return fmt.Errorf("failed to send rumor: %v", err)
 	}
 	n.logger.Debug().Str("packet_id", pkt.Header.PacketID).Msgf("rumor is sent to %v", neighbor)
 
 	// wait for ack. If no ack, send to another neighbor
 	go func() {
-		for acked := false; !acked; {
+		if n.conf.AckTimeout == 0 {
 			n.logger.Debug().Msgf("broadcast wait for ack %v, neighbor %v", pkt.Header.PacketID, pkt.Header.Destination)
+			select {
+			case <-ackCh:
+				return
+			case <-n.ctx.Done():
+				return
+			}
 
-			if n.conf.AckTimeout == 0 {
-				<-ackCh
-				acked = true
-			} else {
-				select {
-				case <-ackCh:
-					acked = true
-				case <-time.After(n.conf.AckTimeout):
-					// TODO: in this case, how to gc (delete map entry)?
-					// send the RumorMessage to another random neighbor
-					if n.neighbors.len() == 1 {
-						n.logger.Warn().Msgf("neighbor did not ack, but has only 1 neighbor")
-						return
-					}
-					newNeighbor := n.neighbors.getRandom()
-					for newNeighbor == neighbor {
-						newNeighbor = n.neighbors.getRandom()
-					}
-					neighbor = newNeighbor
-					hdr = transport.NewHeader(n.getAddr(), n.getAddr(), neighbor, 1)
-					pkt.Header = &hdr
+		}
+		for {
+			n.logger.Debug().Msgf("broadcast wait for ack %v, neighbor %v", pkt.Header.PacketID, pkt.Header.Destination)
+			select {
+			case <-ackCh:
+				return
+			case <-n.ctx.Done():
+				return
+			case <-time.After(n.conf.AckTimeout):
+				n.ackCh.Delete(pkt.Header.PacketID)
 
-					ackCh := make(chan struct{}, 1)
-					n.ackCh.Store(pkt.Header.PacketID, ackCh)
+				// send the RumorMessage to another random neighbor
+				if n.neighbors.hasOnly(neighbor) {
+					n.logger.Warn().Msgf("neighbor did not ack, but do not have any new neighbors")
+					return
+				}
+				neighbor := n.neighbors.getNewRandom(neighbor)
 
-					if err := n.conf.Socket.Send(neighbor, pkt, timeout); err != nil {
-						n.logger.Error().Msgf("failed to send rumor: %v", err)
-					}
+				hdr = transport.NewHeader(n.getAddr(), n.getAddr(), neighbor, 1)
+				pkt.Header = &hdr
+
+				ackCh = make(chan struct{}, 1)
+				n.ackCh.Store(pkt.Header.PacketID, ackCh)
+
+				if err := n.conf.Socket.Send(neighbor, pkt, SocketTimeout); err != nil {
+					n.logger.Error().Msgf("failed to send rumor: %v", err)
 				}
 			}
+
 		}
 	}()
 
@@ -370,46 +398,49 @@ func (n *node) getAddr() string {
 	return n.conf.Socket.GetAddress()
 }
 
+// keep sending rumors with empty message to keep peers' routing tables up-to-date
 func (n *node) heartbeat() {
+	for n.neighbors.len() == 0 {
+		time.Sleep(n.conf.HeartbeatInterval)
+	}
+
 	msg := transport.Message{
 		Type: types.EmptyMessage{}.Name(),
 	}
 
 	for {
-		// TODO: cannot call Broadcast?
 		err := n.Broadcast(msg)
 		if err != nil {
 			n.logger.Trace().Msgf("heartbeat failed")
 		}
 
 		select {
+		case <-time.After(n.conf.HeartbeatInterval):
+			// continue loop
 		case <-n.ctx.Done():
 			return
-		default:
 		}
-		time.Sleep(n.conf.HeartbeatInterval)
 	}
 }
 
 // Convert types.Message (must be pointer) to *transport.Message.
+// Returns nil if marshall failed.
 func (n *node) getMarshalledMsg(msg types.Message) *transport.Message {
 	logger := n.logger.With().CallerWithSkipFrameCount(3).Logger() // report the caller of this function
 	m, err := n.conf.MessageRegistry.MarshalMessage(msg)
 	if err != nil {
 		logger.Error().Msgf("failed to marshall message: %v", err)
-		// TODO: or return nil/error?
-		return &transport.Message{
-			Type:    msg.Name(),
-			Payload: nil,
-		}
+		return nil
 	}
 	return &m
 }
 
+// keep sending status messages to make nodes' views consistent
 func (n *node) antyEntroy() {
 	for n.neighbors.len() == 0 {
 		time.Sleep(n.conf.AntiEntropyInterval)
 	}
+
 	pkt := transport.Packet{}
 	for {
 		neighbor := n.neighbors.getRandom()
@@ -418,16 +449,16 @@ func (n *node) antyEntroy() {
 		n.rumorsMu.Lock()
 		pkt.Msg = n.getMarshalledMsg((*types.StatusMessage)(&n.status))
 		n.rumorsMu.Unlock()
-		if err := n.conf.Socket.Send(neighbor, pkt, timeout); err != nil {
+		if err := n.conf.Socket.Send(neighbor, pkt, SocketTimeout); err != nil {
 			n.logger.Trace().Msgf("failed to send anti-entropy status: %v", err)
 		}
 
 		select {
+		case <-time.After(n.conf.AntiEntropyInterval):
+			// continue loop
 		case <-n.ctx.Done():
 			return
-		default:
 		}
-		time.Sleep(n.conf.AntiEntropyInterval)
 	}
 }
 
@@ -435,13 +466,24 @@ func (n *node) antyEntroy() {
 func logging(logger *zerolog.Logger) func(registry.Exec) registry.Exec {
 	return func(next registry.Exec) registry.Exec {
 		return func(m types.Message, p transport.Packet) error {
-			newlogger := logger.With().CallerWithSkipFrameCount(2).Logger()
-			newlogger.Info().
+			newlogger := logger.With().
 				Str("source", p.Header.Source).
 				Str("packet_id", p.Header.PacketID).
-				Str("message_type", m.Name()).
-				Msgf("process message: %v", m.String())
-			return next(m, p)
+				Str("message_type", p.Msg.Type).
+				Logger()
+			if m == nil {
+				if p.Msg.Type != "empty" {
+					newlogger.Warn().Msgf("nil message")
+				}
+				return next(m, p)
+			}
+			newlogger.Info().Msgf("process message: %v", m.String())
+			if err := next(m, p); err != nil {
+				newlogger.Error().Msgf("error when processing meessage: %v, next %v", err, runtime.FuncForPC(reflect.ValueOf(next).Pointer()).Name())
+				return err
+			} else {
+				return nil
+			}
 		}
 	}
 }

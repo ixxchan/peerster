@@ -20,16 +20,15 @@ func (c *controller) chatHandler(m types.Message, p transport.Packet) error {
 	return nil
 }
 
-// TODO: parallel processing. How to handle errors?
-// TODO: Do I need to Ack to myself?
-// TODO: what about using a single mutex to protect status and log?
+// For local rumors, process them synchronously to ensure no error occurs.
+// For rumors from peers, process them parallely and ignore errors.
 func (c *controller) rumorsHandler(m types.Message, p transport.Packet) error {
 	c.node.rumorsMu.Lock()
-	defer c.node.rumorsMu.Unlock()
 
 	rumors := m.(*types.RumorsMessage)
 	newRumor := false
 
+	routingUpdated := make(map[string]bool)
 	// Process Rumors
 	for _, rumor := range rumors.Rumors {
 		if rumor.Sequence != c.node.status[rumor.Origin]+1 {
@@ -38,9 +37,9 @@ func (c *controller) rumorsHandler(m types.Message, p transport.Packet) error {
 		}
 		newRumor = true
 
-		// TODO: if we have multiple rumors from the same origin, we may update multiple times
-		if !c.node.neighbors.has(rumor.Origin) {
+		if !routingUpdated[rumor.Origin] && !c.node.neighbors.has(rumor.Origin) {
 			c.node.SetRoutingEntry(rumor.Origin, p.Header.RelayedBy)
+			routingUpdated[rumor.Origin] = true
 		}
 
 		newPkt := transport.Packet{
@@ -48,45 +47,50 @@ func (c *controller) rumorsHandler(m types.Message, p transport.Packet) error {
 			Msg:    rumor.Msg,
 		}
 
-		if err := c.node.conf.MessageRegistry.ProcessPacket(newPkt); err != nil {
-			return fmt.Errorf("failed to process rumor: %v", err)
+		if p.Header.Source == c.node.getAddr() {
+			if err := c.node.conf.MessageRegistry.ProcessPacket(newPkt); err != nil {
+				return err
+			}
+		} else {
+			go c.node.conf.MessageRegistry.ProcessPacket(newPkt)
 		}
-		// It is possible that status has already been updated concurrently
-		c.node.status[rumor.Origin] = rumor.Sequence
+
+		c.node.status[rumor.Origin]++
 		c.node.rumorsLog[rumor.Origin] = append(c.node.rumorsLog[rumor.Origin], rumor)
 	}
 
-	if p.Header.Source != c.node.getAddr() {
-		// Send back an AckMessage to the source
-		hdr := transport.NewHeader(c.node.getAddr(), c.node.getAddr(), p.Header.Source, 1)
-		ackMsg := types.AckMessage{
-			AckedPacketID: p.Header.PacketID,
-			// TODO: before or after processing rumors?
-			Status: c.node.status,
-		}
-		ackPkt := transport.Packet{
-			Header: &hdr,
-			Msg:    c.node.getMarshalledMsg(&ackMsg),
-		}
-		if err := c.node.conf.Socket.Send(p.Header.Source, ackPkt, timeout); err != nil {
-			return fmt.Errorf("failed to send rumor ack: %v", err)
-		}
+	if p.Header.Source == c.node.getAddr() {
+		c.node.rumorsMu.Unlock()
+		return nil
+	}
 
-		// Send the RumorMessage to another random neighbor in the case where one of the Rumor data in the packet is new
-		if newRumor {
-			if c.node.neighbors.len() == 0 || c.node.neighbors.len() == 1 && c.node.neighbors.has(p.Header.Source) {
-				return nil
-			}
-			neighbor := c.node.neighbors.getRandom()
-			for neighbor == p.Header.Source {
-				neighbor = c.node.neighbors.getRandom()
-			}
+	// Send back an AckMessage to the source
+	hdr := transport.NewHeader(c.node.getAddr(), c.node.getAddr(), p.Header.Source, 1)
+	ackMsg := types.AckMessage{
+		AckedPacketID: p.Header.PacketID,
+		Status:        c.node.status,
+	}
+	ackPkt := transport.Packet{
+		Header: &hdr,
+		Msg:    c.node.getMarshalledMsg(&ackMsg),
+	}
+	c.node.rumorsMu.Unlock()
 
-			hdr := transport.NewHeader(c.node.getAddr(), c.node.getAddr(), neighbor, 1)
-			p.Header = &hdr
-			if err := c.node.conf.Socket.Send(neighbor, p, timeout); err != nil {
-				return fmt.Errorf("failed to send rumor: %v", err)
-			}
+	if err := c.node.conf.Socket.Send(p.Header.Source, ackPkt, SocketTimeout); err != nil {
+		return fmt.Errorf("failed to send rumor ack: %v", err)
+	}
+
+	// Send the RumorMessage to another random neighbor in the case where one of the Rumor data in the packet is new
+	if newRumor {
+		if c.node.neighbors.len() == 0 || c.node.neighbors.hasOnly(p.Header.Source) {
+			return nil
+		}
+		neighbor := c.node.neighbors.getNewRandom(p.Header.Source)
+
+		hdr := transport.NewHeader(c.node.getAddr(), c.node.getAddr(), neighbor, 1)
+		p.Header = &hdr
+		if err := c.node.conf.Socket.Send(neighbor, p, SocketTimeout); err != nil {
+			return fmt.Errorf("failed to send rumor: %v", err)
 		}
 	}
 
@@ -101,7 +105,7 @@ func (c *controller) statusHandler(m types.Message, p transport.Packet) error {
 	remoteHasNew := false
 	var remoteMissing []types.Rumor
 
-	c.node.logger.Debug().Msgf("status %v, my status %v", remoteStatus, c.node.status)
+	c.node.logger.Trace().Msgf("status %v, my status %v", remoteStatus, c.node.status)
 
 	remoteCnt := 0
 	for origin, localSeq := range c.node.status {
@@ -125,7 +129,7 @@ func (c *controller) statusHandler(m types.Message, p transport.Packet) error {
 			Header: &hdr,
 			Msg:    c.node.getMarshalledMsg((*types.StatusMessage)(&c.node.status)),
 		}
-		if err := c.node.conf.Socket.Send(p.Header.Source, pkt, timeout); err != nil {
+		if err := c.node.conf.Socket.Send(p.Header.Source, pkt, SocketTimeout); err != nil {
 			c.node.logger.Trace().Msgf("failed to send status: %v", err)
 		}
 	}
@@ -136,23 +140,21 @@ func (c *controller) statusHandler(m types.Message, p transport.Packet) error {
 			Header: &hdr,
 			Msg:    c.node.getMarshalledMsg(&types.RumorsMessage{Rumors: remoteMissing}),
 		}
-		if err := c.node.conf.Socket.Send(p.Header.Source, pkt, timeout); err != nil {
+		if err := c.node.conf.Socket.Send(p.Header.Source, pkt, SocketTimeout); err != nil {
 			c.node.logger.Trace().Msgf("failed to send rumors: %v", err)
 		}
 		// Do not wait for the possible ack message
 	}
 
 	if !remoteHasNew && remoteMissing == nil {
-		if rand.Float64() < c.node.conf.ContinueMongering {
+		if c.node.neighbors.len() == 0 || c.node.neighbors.hasOnly(p.Header.Source) {
+			// do not has new neighbors, skip ContinueMongering
+			return nil
+		}
 
+		if rand.Float64() < c.node.conf.ContinueMongering {
 			// send a status message to a random neighbor
-			neighbor := c.node.neighbors.getRandom()
-			if neighbor == p.Header.Source && c.node.neighbors.len() == 1 {
-				return nil
-			}
-			for neighbor == p.Header.Source {
-				neighbor = c.node.neighbors.getRandom()
-			}
+			neighbor := c.node.neighbors.getNewRandom(p.Header.Source)
 
 			hdr := transport.NewHeader(c.node.getAddr(), c.node.getAddr(), neighbor, 0)
 			pkt := transport.Packet{
@@ -160,8 +162,8 @@ func (c *controller) statusHandler(m types.Message, p transport.Packet) error {
 				Msg:    c.node.getMarshalledMsg((*types.StatusMessage)(&c.node.status)),
 			}
 
-			if err := c.node.conf.Socket.Send(neighbor, pkt, timeout); err != nil {
-				c.node.logger.Trace().Msgf("failed to send status: %v", err)
+			if err := c.node.conf.Socket.Send(neighbor, pkt, SocketTimeout); err != nil {
+				c.node.logger.Warn().Msgf("failed to send status: %v", err)
 			}
 		}
 	}
@@ -172,7 +174,7 @@ func (c *controller) statusHandler(m types.Message, p transport.Packet) error {
 func (c *controller) ackHandler(m types.Message, p transport.Packet) error {
 	ack := m.(*types.AckMessage)
 	value, ok := c.node.ackCh.Load(ack.AckedPacketID)
-	// When statusHandler sends missing rumor, the node is not waiting for ack
+	// The node may not be waiting for ack, when statusHandler sends missing rumor, or it had waited for AckTimeout.
 	if ok {
 		// Each packet should only be acked once
 		ackCh := value.(chan struct{})
@@ -208,7 +210,7 @@ func (c *controller) privateHandler(m types.Message, p transport.Packet) error {
 			Msg:    pm.Msg,
 		}
 		if err := c.node.conf.MessageRegistry.ProcessPacket(pkt); err != nil {
-			return fmt.Errorf("failed to process rumor: %v", err)
+			return fmt.Errorf("failed to process private message: %v", err)
 		}
 	}
 	return nil
