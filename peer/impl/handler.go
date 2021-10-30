@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 
+	"github.com/rs/zerolog"
+	"go.dedis.ch/cs438/registry"
 	"go.dedis.ch/cs438/transport"
 	"go.dedis.ch/cs438/types"
 )
@@ -214,4 +216,49 @@ func (c *controller) privateHandler(m types.Message, p transport.Packet) error {
 		}
 	}
 	return nil
+}
+
+func (c *controller) dataRequestHandler(m types.Message, p transport.Packet) error {
+	dReq := m.(*types.DataRequestMessage)
+	c.node.logger.Debug().Msgf("data request %v", dReq)
+	return nil
+}
+
+func (c *controller) dataReplyHandler(m types.Message, p transport.Packet) error {
+	dRep := m.(*types.DataReplyMessage)
+	c.node.logger.Debug().Msgf("data reply %v", dRep)
+	return nil
+}
+
+func (c *controller) searchRequestHandler(m types.Message, p transport.Packet) error {
+	sReq := m.(*types.SearchRequestMessage)
+	c.node.logger.Debug().Msgf("search request %v", sReq)
+	return nil
+}
+
+func (c *controller) searchReplyHandler(m types.Message, p transport.Packet) error {
+	sRep := m.(*types.SearchReplyMessage)
+	c.node.logger.Debug().Msgf("search reply %v", sRep)
+	return nil
+}
+
+// logging is a utility function that adds logging in a handler
+func logging(logger *zerolog.Logger) func(registry.Exec) registry.Exec {
+	return func(next registry.Exec) registry.Exec {
+		return func(m types.Message, p transport.Packet) error {
+			newlogger := logger.With().
+				Str("source", p.Header.Source).
+				Str("packet_id", p.Header.PacketID).
+				Str("message_type", p.Msg.Type).
+				Logger()
+			if m == nil {
+				if p.Msg.Type != "empty" {
+					newlogger.Warn().Msgf("nil message")
+				}
+				return next(m, p)
+			}
+			newlogger.Info().Msgf("process message: %v", m.String())
+			return next(m, p)
+		}
+	}
 }

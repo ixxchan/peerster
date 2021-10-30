@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
-	"reflect"
-	"runtime"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,7 +14,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.dedis.ch/cs438/peer"
-	"go.dedis.ch/cs438/registry"
 	"go.dedis.ch/cs438/transport"
 	"go.dedis.ch/cs438/types"
 )
@@ -92,84 +89,21 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 
 	ctrl := NewController(node)
 	conf.MessageRegistry.RegisterMessageCallback(types.ChatMessage{}, logging(&node.logger)(ctrl.chatHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.EmptyMessage{}, logging(&node.logger)(ctrl.emptyHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.PrivateMessage{}, logging(&node.logger)(ctrl.privateHandler))
+
 	conf.MessageRegistry.RegisterMessageCallback(types.RumorsMessage{}, logging(&node.logger)(ctrl.rumorsHandler))
 	conf.MessageRegistry.RegisterMessageCallback(types.StatusMessage{}, logging(&node.logger)(ctrl.statusHandler))
 	conf.MessageRegistry.RegisterMessageCallback(types.AckMessage{}, logging(&node.logger)(ctrl.ackHandler))
-	conf.MessageRegistry.RegisterMessageCallback(types.EmptyMessage{}, logging(&node.logger)(ctrl.emptyHandler))
-	conf.MessageRegistry.RegisterMessageCallback(types.PrivateMessage{}, logging(&node.logger)(ctrl.privateHandler))
+
+	conf.MessageRegistry.RegisterMessageCallback(types.DataRequestMessage{}, logging(&node.logger)(ctrl.dataRequestHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.DataReplyMessage{}, logging(&node.logger)(ctrl.dataReplyHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.SearchReplyMessage{}, logging(&node.logger)(ctrl.searchReplyHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.SearchRequestMessage{}, logging(&node.logger)(ctrl.searchRequestHandler))
 
 	// routingTable[myAddr] = myAddr
 	node.AddPeer(conf.Socket.GetAddress())
 	return node
-}
-
-type neighbors struct {
-	sync.RWMutex
-	data []string
-}
-
-func (ns *neighbors) len() int {
-	ns.Lock()
-	defer ns.Unlock()
-
-	return len(ns.data)
-}
-
-func (ns *neighbors) add(neighbor string) {
-	ns.Lock()
-	defer ns.Unlock()
-
-	ns.data = append(ns.data, neighbor)
-}
-
-func (ns *neighbors) delete(neighbor string) {
-	ns.Lock()
-	defer ns.Unlock()
-
-	for i, v := range ns.data {
-		if v == neighbor {
-			ns.data = append(ns.data[:i], ns.data[i+1:]...)
-			return
-		}
-	}
-}
-
-func (ns *neighbors) getRandom() string {
-	ns.RLock()
-	defer ns.RUnlock()
-
-	return ns.data[rand.Intn(len(ns.data))]
-}
-
-func (ns *neighbors) getNewRandom(oldNeighbor string) string {
-	ns.RLock()
-	defer ns.RUnlock()
-
-	for {
-		neighbor := ns.data[rand.Intn(len(ns.data))]
-		if neighbor != oldNeighbor {
-			return neighbor
-		}
-	}
-}
-
-func (ns *neighbors) hasOnly(neighbor string) bool {
-	ns.Lock()
-	defer ns.Unlock()
-
-	return len(ns.data) == 1 && ns.data[0] == neighbor
-}
-
-func (ns *neighbors) has(neighbor string) bool {
-	ns.Lock()
-	defer ns.Unlock()
-
-	for _, v := range ns.data {
-		if v == neighbor {
-			return true
-		}
-	}
-	return false
 }
 
 // node implements a peer to build a Peerster system
@@ -462,28 +396,75 @@ func (n *node) antyEntroy() {
 	}
 }
 
-// logging is a utility function that adds logging in a handler
-func logging(logger *zerolog.Logger) func(registry.Exec) registry.Exec {
-	return func(next registry.Exec) registry.Exec {
-		return func(m types.Message, p transport.Packet) error {
-			newlogger := logger.With().
-				Str("source", p.Header.Source).
-				Str("packet_id", p.Header.PacketID).
-				Str("message_type", p.Msg.Type).
-				Logger()
-			if m == nil {
-				if p.Msg.Type != "empty" {
-					newlogger.Warn().Msgf("nil message")
-				}
-				return next(m, p)
-			}
-			newlogger.Info().Msgf("process message: %v", m.String())
-			if err := next(m, p); err != nil {
-				newlogger.Error().Msgf("error when processing meessage: %v, next %v", err, runtime.FuncForPC(reflect.ValueOf(next).Pointer()).Name())
-				return err
-			} else {
-				return nil
-			}
-		}
-	}
+// Upload stores a new data blob on the peer and will make it available to
+// other peers. The blob will be split into chunks.
+//
+// - Implemented in HW2
+func (n *node) Upload(data io.Reader) (metahash string, err error) {
+	panic("not implemented") // TODO: Implement
+}
+
+// Download will get all the necessary chunks corresponding to the given
+// metahash that references a blob, and return a reconstructed blob. The
+// peer will save locally the chunks that it doesn't have for further
+// sharing. Returns an error if it can't get the necessary chunks.
+//
+// - Implemented in HW2
+func (n *node) Download(metahash string) ([]byte, error) {
+
+	panic("not implemented") // TODO: Implement
+}
+
+// Tag creates a mapping between a (file)name and a metahash.
+//
+// - Implemented in HW2
+// - Improved in HW3: ensure uniqueness with blockchain/TLC/Paxos
+func (n *node) Tag(name string, mh string) error {
+	panic("not implemented") // TODO: Implement
+}
+
+// Resolve returns the corresponding metahash of a given (file)name. Returns
+// an empty string if not found.
+//
+// - Implemented in HW2
+func (n *node) Resolve(name string) (metahash string) {
+	panic("not implemented") // TODO: Implement
+}
+
+// GetCatalog returns the peer's catalog. See below for the definition of a
+// catalog.
+//
+// - Implemented in HW2
+func (n *node) GetCatalog() peer.Catalog {
+	panic("not implemented") // TODO: Implement
+}
+
+// UpdateCatalog tells the peer about a piece of data referenced by 'key'
+// being available on other peers. It should update the peer's catalog. See
+// below for the definition of a catalog.
+//
+// - Implemented in HW2
+func (n *node) UpdateCatalog(key string, peer string) {
+	panic("not implemented") // TODO: Implement
+}
+
+// SearchAll returns all the names that exist matching the given regex. It
+// merges results from the local storage and from the search request reply
+// sent to a random neighbor using the provided budget. It makes the peer
+// update its catalog and name storage according to the SearchReplyMessages
+// received. Returns an empty result if nothing found. An error is returned
+// in case of an exceptional event.
+//
+// - Implemented in HW2
+func (n *node) SearchAll(reg regexp.Regexp, budget uint, timeout time.Duration) (names []string, err error) {
+	panic("not implemented") // TODO: Implement
+}
+
+// SearchFirst uses an expanding ring configuration and returns a name as
+// soon as it finds a peer that "fully matches" a data blob. It makes the
+// peer update its catalog and name storage according to the
+// SearchReplyMessages received. Returns an empty string if nothing was
+// found.
+func (n *node) SearchFirst(pattern regexp.Regexp, conf peer.ExpandingRing) (name string, err error) {
+	panic("not implemented") // TODO: Implement
 }
