@@ -220,13 +220,51 @@ func (c *controller) privateHandler(m types.Message, p transport.Packet) error {
 
 func (c *controller) dataRequestHandler(m types.Message, p transport.Packet) error {
 	dReq := m.(*types.DataRequestMessage)
-	c.node.logger.Debug().Msgf("data request %v", dReq)
+	reply := &types.DataReplyMessage{
+		RequestID: dReq.RequestID,
+		Key:       dReq.Key,
+		Value:     c.node.conf.Storage.GetDataBlobStore().Get(dReq.Key),
+	}
+	msg := c.node.getMarshalledMsg(reply)
+	hdr := transport.NewHeader(c.node.getAddr(), c.node.getAddr(), p.Header.Source, 0)
+	pkt := transport.Packet{
+		Header: &hdr,
+		Msg:    msg,
+	}
+	nextHop := c.node.routingTable.Get(p.Header.Source)
+	if err := c.node.conf.Socket.Send(nextHop, pkt, SocketTimeout); err != nil {
+		return fmt.Errorf("failed to send data reply: %v", err)
+	}
 	return nil
 }
 
 func (c *controller) dataReplyHandler(m types.Message, p transport.Packet) error {
 	dRep := m.(*types.DataReplyMessage)
-	c.node.logger.Debug().Msgf("data reply %v", dRep)
+	value, ok := c.node.dataReplyCh.Load(dRep.RequestID)
+	if !ok {
+		c.node.logger.Trace().Str("request_id", dRep.RequestID).Msgf("not waiting for reply")
+		return nil
+	}
+
+	dataReplyCh := value.(struct {
+		ch  chan []byte
+		key string
+	})
+
+	if dataReplyCh.key != dRep.Key {
+		c.node.logger.Warn().
+			Str("request_id", dRep.RequestID).
+			Str("reply_key", dRep.Key).
+			Str("request_key", dataReplyCh.key).
+			Msgf("key mismatch")
+		dataReplyCh.ch <- nil
+		return nil
+	}
+	select {
+	case dataReplyCh.ch <- dRep.Value:
+	default:
+		c.node.logger.Warn().Str("request_id", dRep.RequestID).Msgf("blocking reply")
+	}
 	return nil
 }
 

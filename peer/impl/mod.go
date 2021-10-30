@@ -2,6 +2,8 @@ package impl
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/rs/xid"
 	"github.com/rs/zerolog"
 	"go.dedis.ch/cs438/peer"
 	"go.dedis.ch/cs438/transport"
@@ -74,9 +77,10 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 
 	node := &node{
 		conf:         conf,
-		routingTable: NewConcurrentMap(),
+		routingTable: NewConcurrentMapString(),
 		status:       make(map[string]uint),
 		rumorsLog:    make(map[string][]types.Rumor),
+		catalog:      NewConcurrentMapSet(),
 
 		ctx:        ctx,
 		cancelFunc: cancelFunc,
@@ -110,10 +114,21 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 //
 // - implements peer.Peer
 type node struct {
-	conf         peer.Configuration
-	routingTable ConcurrentMap
+	conf peer.Configuration
 
-	neighbors neighbors
+	// ****** utility fields ********
+
+	ctx        context.Context
+	cancelFunc context.CancelFunc
+	logger     zerolog.Logger
+
+	// ******** common fields ********
+
+	routingTable ConcurrentMapString
+	neighbors    neighbors
+
+	// ******** rumor fields ********
+
 	// rumor sequence number, equal to the number of rumors this node has created
 	//
 	// should use atomic operation to get/set
@@ -134,10 +149,11 @@ type node struct {
 	// They do not require rumorsMu, and accessing the whole map is not needed, so simply use sync.Map.
 	ackCh sync.Map
 
-	ctx        context.Context
-	cancelFunc context.CancelFunc
+	// ******** data sharing fields ********
 
-	logger zerolog.Logger
+	catalog ConcurrentMapSet
+	// RequestID -> struct {ch chan []byte, key string}
+	dataReplyCh sync.Map
 }
 
 // Start implements peer.Service
@@ -401,70 +417,182 @@ func (n *node) antyEntroy() {
 //
 // - Implemented in HW2
 func (n *node) Upload(data io.Reader) (metahash string, err error) {
-	panic("not implemented") // TODO: Implement
+	var buf []byte
+	var chunkHashHexes []string
+	blobStore := n.conf.Storage.GetDataBlobStore()
+
+	for {
+		chunk := make([]byte, n.conf.ChunkSize)
+		len, err := data.Read(chunk)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return "", fmt.Errorf("failed to read data: %v", err)
+		}
+		chunkHash := sha256.Sum256(chunk[:len])
+		chunkHashHex := hex.EncodeToString(chunkHash[:])
+		blobStore.Set(chunkHashHex, chunk[:len])
+
+		chunkHashHexes = append(chunkHashHexes, chunkHashHex)
+		buf = append(buf, chunkHash[:]...)
+	}
+
+	metahashBytes := sha256.Sum256(buf)
+	metahash = hex.EncodeToString(metahashBytes[:])
+	blobStore.Set(metahash, []byte(strings.Join(chunkHashHexes, peer.MetafileSep)))
+
+	return metahash, nil
 }
 
-// Download will get all the necessary chunks corresponding to the given
-// metahash that references a blob, and return a reconstructed blob. The
-// peer will save locally the chunks that it doesn't have for further
-// sharing. Returns an error if it can't get the necessary chunks.
-//
-// - Implemented in HW2
+// implements peer.DataSharing
 func (n *node) Download(metahash string) ([]byte, error) {
+	var file []byte
 
-	panic("not implemented") // TODO: Implement
+	dataCh, errCh := n.download(metahash)
+	var metafile []byte
+	select {
+	case metafile = <-dataCh:
+	case err := <-errCh:
+		if strings.Contains(err.Error(), "file inexistent") {
+			n.logger.Trace().Str("metahash", metahash).Err(err).Msgf("failed to download metafile")
+			return nil, fmt.Errorf("failed to download metafile: inexistent")
+		} else if strings.Contains(err.Error(), "timeout") {
+			n.logger.Trace().Str("metahash", metahash).Err(err).Msgf("failed to download metafile")
+			return nil, fmt.Errorf("failed to download metafile: timeout")
+		} else {
+			n.logger.Warn().Str("metahash", metahash).Err(err).Msgf("failed to download metafile")
+			return nil, fmt.Errorf("failed to download metafile: %v", err)
+		}
+	}
+
+	chunkHashHexes := strings.Split(string(metafile), peer.MetafileSep)
+
+	for _, chunkHashHex := range chunkHashHexes {
+		dataCh, errCh := n.download(chunkHashHex)
+		select {
+		case chunk := <-dataCh:
+			file = append(file, chunk...)
+		case err := <-errCh:
+			if strings.Contains(err.Error(), "file inexistent") {
+				n.logger.Trace().
+					Str("metahash", metahash).
+					Str("chunk_hash", chunkHashHex).
+					Err(err).
+					Msgf("failed to download chunk")
+				return nil, fmt.Errorf("failed to download chunk: inexistent")
+			} else if strings.Contains(err.Error(), "timeout") {
+				n.logger.Trace().Str("metahash", metahash).
+					Str("chunk_hash", chunkHashHex).
+					Err(err).
+					Msgf("failed to download chunk")
+				return nil, fmt.Errorf("failed to download chunk: timeout")
+			} else {
+				n.logger.Warn().Str("metahash", metahash).
+					Str("chunk_hash", chunkHashHex).
+					Err(err).
+					Msgf("failed to download chunk")
+				return nil, fmt.Errorf("failed to download chunk: %v", err)
+			}
+		}
+	}
+
+	return file, nil
 }
 
-// Tag creates a mapping between a (file)name and a metahash.
-//
-// - Implemented in HW2
-// - Improved in HW3: ensure uniqueness with blockchain/TLC/Paxos
+// Download a single block of data (metafile/chunk) from local storage or a peer.
+// If dataCh gets a value, it is non-nil. If timeout, an error is returned.
+func (n *node) download(hash string) (dataCh chan []byte, errCh chan error) {
+	dataCh = make(chan []byte, 1)
+	errCh = make(chan error, 1)
+
+	blobStore := n.conf.Storage.GetDataBlobStore()
+	data := blobStore.Get(hash)
+	if len(data) != 0 {
+		dataCh <- data
+		return
+	}
+
+	peer := n.catalog.GetRandom(hash)
+	if peer == "" {
+		errCh <- fmt.Errorf("file inexistent")
+		return
+	}
+	nextHop := n.routingTable.Get(peer)
+	if nextHop == "" {
+		errCh <- fmt.Errorf("no routing: %v", peer)
+		return
+	}
+
+	req := types.DataRequestMessage{
+		RequestID: xid.New().String(),
+		Key:       hash,
+	}
+	msg := n.getMarshalledMsg(&req)
+	hdr := transport.NewHeader(n.getAddr(), n.getAddr(), peer, 0)
+	pkt := transport.Packet{
+		Header: &hdr,
+		Msg:    msg,
+	}
+
+	dataReplyCh := make(chan []byte, 1)
+	n.dataReplyCh.Store(req.RequestID, struct {
+		ch  chan []byte
+		key string
+	}{dataReplyCh, hash})
+	defer n.dataReplyCh.Delete(req.RequestID)
+
+	if err := n.conf.Socket.Send(nextHop, pkt, SocketTimeout); err != nil {
+		errCh <- fmt.Errorf("failed to send data request: %v", err)
+		return
+	}
+
+	backoff := n.conf.BackoffDataRequest
+	for i := 0; i < int(backoff.Retry); i++ {
+		select {
+		case <-time.After(backoff.Initial):
+			backoff.Initial *= time.Duration(backoff.Factor)
+		case data := <-dataReplyCh:
+			if len(data) == 0 {
+				errCh <- fmt.Errorf("peer returns an empty value")
+				return
+			} else {
+				dataCh <- data
+				return
+			}
+		}
+	}
+
+	errCh <- fmt.Errorf("timeout")
+	return
+}
+
+// implements peer.DataSharing
 func (n *node) Tag(name string, mh string) error {
 	panic("not implemented") // TODO: Implement
 }
 
-// Resolve returns the corresponding metahash of a given (file)name. Returns
-// an empty string if not found.
-//
-// - Implemented in HW2
+// implements peer.DataSharing
 func (n *node) Resolve(name string) (metahash string) {
 	panic("not implemented") // TODO: Implement
 }
 
-// GetCatalog returns the peer's catalog. See below for the definition of a
-// catalog.
-//
-// - Implemented in HW2
+// implements peer.DataSharing
 func (n *node) GetCatalog() peer.Catalog {
-	panic("not implemented") // TODO: Implement
+	return n.catalog.GetMap()
 }
 
-// UpdateCatalog tells the peer about a piece of data referenced by 'key'
-// being available on other peers. It should update the peer's catalog. See
-// below for the definition of a catalog.
-//
-// - Implemented in HW2
+// implements peer.DataSharing
 func (n *node) UpdateCatalog(key string, peer string) {
-	panic("not implemented") // TODO: Implement
+	n.catalog.Add(key, peer)
 }
 
-// SearchAll returns all the names that exist matching the given regex. It
-// merges results from the local storage and from the search request reply
-// sent to a random neighbor using the provided budget. It makes the peer
-// update its catalog and name storage according to the SearchReplyMessages
-// received. Returns an empty result if nothing found. An error is returned
-// in case of an exceptional event.
-//
-// - Implemented in HW2
+// implements peer.DataSharing
 func (n *node) SearchAll(reg regexp.Regexp, budget uint, timeout time.Duration) (names []string, err error) {
 	panic("not implemented") // TODO: Implement
 }
 
-// SearchFirst uses an expanding ring configuration and returns a name as
-// soon as it finds a peer that "fully matches" a data blob. It makes the
-// peer update its catalog and name storage according to the
-// SearchReplyMessages received. Returns an empty string if nothing was
-// found.
+// implements peer.DataSharing
 func (n *node) SearchFirst(pattern regexp.Regexp, conf peer.ExpandingRing) (name string, err error) {
 	panic("not implemented") // TODO: Implement
 }
