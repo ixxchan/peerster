@@ -3,6 +3,7 @@ package impl
 import (
 	"fmt"
 	"math/rand"
+	"regexp"
 
 	"github.com/rs/zerolog"
 	"go.dedis.ch/cs438/registry"
@@ -107,7 +108,7 @@ func (c *controller) statusHandler(m types.Message, p transport.Packet) error {
 	remoteHasNew := false
 	var remoteMissing []types.Rumor
 
-	c.node.logger.Trace().Msgf("status %v, my status %v", remoteStatus, c.node.status)
+	// c.node.logger.Trace().Msgf("status %v, my status %v", remoteStatus, c.node.status)
 
 	remoteCnt := 0
 	for origin, localSeq := range c.node.status {
@@ -231,10 +232,20 @@ func (c *controller) dataRequestHandler(m types.Message, p transport.Packet) err
 		Header: &hdr,
 		Msg:    msg,
 	}
+	// The reply message must be sent back using the routing table.
 	nextHop := c.node.routingTable.Get(p.Header.Source)
 	if err := c.node.conf.Socket.Send(nextHop, pkt, SocketTimeout); err != nil {
-		return fmt.Errorf("failed to send data reply: %v", err)
+		c.node.logger.Warn().
+			Str("request_id", dReq.RequestID).
+			Str("hash", dReq.Key).
+			Str("next_hop", nextHop).
+			Msgf("failed to send datareply: %v", err)
+		return fmt.Errorf("failed to send datareply: %v", err)
 	}
+	c.node.logger.Trace().
+		Str("request_id", dReq.RequestID).
+		Str("hash", dReq.Key).
+		Msgf("datareply sent")
 	return nil
 }
 
@@ -260,6 +271,12 @@ func (c *controller) dataReplyHandler(m types.Message, p transport.Packet) error
 		dataReplyCh.ch <- nil
 		return nil
 	}
+	c.node.logger.Trace().
+		Str("request_id", dRep.RequestID).
+		Str("source", p.Header.Source).
+		Str("hash", dRep.Key).
+		Msgf("datareply received")
+
 	select {
 	case dataReplyCh.ch <- dRep.Value:
 	default:
@@ -270,13 +287,93 @@ func (c *controller) dataReplyHandler(m types.Message, p transport.Packet) error
 
 func (c *controller) searchRequestHandler(m types.Message, p transport.Packet) error {
 	sReq := m.(*types.SearchRequestMessage)
-	c.node.logger.Debug().Msgf("search request %v", sReq)
+
+	// Forward the search if the budget permits.
+	if sReq.Budget > 1 {
+		go func() {
+			for neighbor, bgt := range c.node.divideBudget(sReq.Budget-1, p.Header.Source) {
+				newReq := sReq
+				newReq.Budget = bgt
+				hdr := transport.NewHeader(c.node.getAddr(), c.node.getAddr(), neighbor, 0)
+				pkt := transport.Packet{
+					Header: &hdr,
+					Msg:    c.node.getMarshalledMsg(newReq),
+				}
+				if err := c.node.conf.Socket.Send(neighbor, pkt, SocketTimeout); err != nil {
+					c.node.logger.Error().
+						Str("request_id", sReq.RequestID).
+						Msgf("failed to forward search request: %v", err)
+				}
+				c.node.logger.Trace().
+					Str("request_id", sReq.RequestID).
+					Msgf("forwarded search request to %v", neighbor)
+			}
+		}()
+	}
+
+	if _, ok := c.node.handledSearchReq.Load(sReq.RequestID); ok {
+		c.node.logger.Trace().Str("request_id", sReq.RequestID).Msgf("duplicate search request")
+		return fmt.Errorf("duplicate search request")
+	}
+	c.node.handledSearchReq.Store(sReq.RequestID, nil)
+
+	sRep := &types.SearchReplyMessage{
+		RequestID: sReq.RequestID,
+		Responses: c.node.searchLocal(regexp.MustCompile(sReq.Pattern), false),
+	}
+	msg := c.node.getMarshalledMsg(sRep)
+
+	// The reply must be directly sent to the packet's source (it can be the
+	// peer that originated the search request, or a peer that forwarded a search request)
+	// without using the routing table.
+	// The Destination field of the packet’s header must be
+	// set to the searchMessage.Origin.
+	hdr := transport.NewHeader(c.node.getAddr(), c.node.getAddr(), sReq.Origin, 0)
+	pkt := transport.Packet{
+		Header: &hdr,
+		Msg:    msg,
+	}
+	if err := c.node.conf.Socket.Send(p.Header.Source, pkt, SocketTimeout); err != nil {
+		c.node.logger.Error().Msgf("failed to send search reply: %v", err)
+		return fmt.Errorf("failed to send search reply: %v", err)
+	}
+	c.node.logger.Trace().
+		Str("request_id", sReq.RequestID).
+		Str("destination", hdr.Destination).
+		Msgf("search reply sent")
 	return nil
 }
 
 func (c *controller) searchReplyHandler(m types.Message, p transport.Packet) error {
 	sRep := m.(*types.SearchReplyMessage)
-	c.node.logger.Debug().Msgf("search reply %v", sRep)
+	c.node.logger.Trace().
+		Str("request_id", sRep.RequestID).
+		Str("source", p.Header.Source).
+		Msgf("search reply received")
+	// update naming store and catalog
+	for _, resp := range sRep.Responses {
+		c.node.conf.Storage.GetNamingStore().Set(resp.Name, []byte(resp.Metahash))
+		c.node.UpdateCatalog(resp.Metahash, p.Header.Source)
+		for _, chunk := range resp.Chunks {
+			if chunk != nil {
+				c.node.UpdateCatalog(string(chunk), p.Header.Source)
+			}
+		}
+	}
+
+	value, ok := c.node.searchReplyCh.Load(sRep.RequestID)
+	if !ok {
+		c.node.logger.Trace().
+			Str("request_id", sRep.RequestID).
+			Str("packet_id", p.Header.PacketID).
+			Msgf("not waiting for reply")
+	}
+	searchReplyCh := value.(chan []types.FileInfo)
+	select {
+	case searchReplyCh <- sRep.Responses:
+	default:
+		c.node.logger.Warn().Str("request_id", sRep.RequestID).Msgf("blocking reply")
+	}
 	return nil
 }
 
@@ -289,6 +386,9 @@ func logging(logger *zerolog.Logger) func(registry.Exec) registry.Exec {
 				Str("packet_id", p.Header.PacketID).
 				Str("message_type", p.Msg.Type).
 				Logger()
+			if ignoreMsgTypeInLog()[p.Msg.Type] {
+				newlogger = newlogger.Level(zerolog.Disabled)
+			}
 			if m == nil {
 				if p.Msg.Type != "empty" {
 					newlogger.Warn().Msgf("nil message")

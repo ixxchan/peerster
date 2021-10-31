@@ -36,6 +36,13 @@ func (ns *neighbors) delete(neighbor string) {
 	}
 }
 
+func (ns *neighbors) getAll() []string {
+	ns.Lock()
+	defer ns.Unlock()
+
+	return ns.data[:]
+}
+
 func (ns *neighbors) getRandom() string {
 	ns.RLock()
 	defer ns.RUnlock()

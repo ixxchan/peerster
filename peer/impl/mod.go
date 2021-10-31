@@ -21,6 +21,15 @@ import (
 	"go.dedis.ch/cs438/types"
 )
 
+func ignoreMsgTypeInLog() map[string]bool {
+	empty := types.EmptyMessage{}
+	status := types.StatusMessage{}
+	return map[string]bool{
+		empty.Name():  true,
+		status.Name(): true,
+	}
+}
+
 // envLogLevel is the name of the environment variable to change the logging
 // level.
 //
@@ -154,6 +163,9 @@ type node struct {
 	catalog ConcurrentMapSet
 	// RequestID -> struct {ch chan []byte, key string}
 	dataReplyCh sync.Map
+	// RequestID -> []FileInfo
+	searchReplyCh    sync.Map
+	handledSearchReq sync.Map
 }
 
 // Start implements peer.Service
@@ -180,16 +192,21 @@ func (n *node) Start() error {
 				}
 				continue
 			}
-
 			pktLogger := n.logger.With().
 				Str("source", pkt.Header.Source).
 				Str("destination", pkt.Header.Destination).
-				Str("packet_id", pkt.Header.PacketID).Logger()
+				Str("packet_id", pkt.Header.PacketID).
+				Str("message_type", pkt.Msg.Type).
+				Logger()
+			if ignoreMsgTypeInLog()[pkt.Msg.Type] {
+				pktLogger = pktLogger.Level(zerolog.Disabled)
+			}
+
 			pktLogger.Trace().Msgf("received packet")
 			if pkt.Header.Destination != n.getAddr() {
 				nextHop := n.routingTable.Get(pkt.Header.Destination)
 				if nextHop == "" {
-					n.logger.Debug().Msgf("unknown relay destination: %v", pkt.Header.Destination)
+					pktLogger.Info().Msgf("unknown relay destination")
 				} else {
 					pktLogger.Trace().Msgf("relay packet")
 					pkt.Header.RelayedBy = n.getAddr()
@@ -256,7 +273,7 @@ func (n *node) Broadcast(msg transport.Message) error {
 
 	// sends the rumor to a random neighbor.
 	if n.neighbors.len() == 0 {
-		n.logger.Warn().Msgf("has none neighbors to broadcast")
+		n.logger.Info().Msgf("has none neighbors to broadcast")
 		return nil
 	}
 	neighbor := n.neighbors.getRandom()
@@ -333,6 +350,7 @@ func (n *node) GetRoutingTable() peer.RoutingTable {
 func (n *node) SetRoutingEntry(origin, relayAddr string) {
 	origin = strings.TrimSpace(origin)
 	relayAddr = strings.TrimSpace(relayAddr)
+	n.logger.Info().Msgf("set routing entry: %v -> %v", origin, relayAddr)
 	if relayAddr == "" {
 		n.routingTable.Delete(origin)
 		n.neighbors.delete(origin)
@@ -350,9 +368,7 @@ func (n *node) getAddr() string {
 
 // keep sending rumors with empty message to keep peers' routing tables up-to-date
 func (n *node) heartbeat() {
-	for n.neighbors.len() == 0 {
-		time.Sleep(n.conf.HeartbeatInterval)
-	}
+	// We don't need to wait until the node has a peer, thanks to the anti-entropy mechanism
 
 	msg := transport.Message{
 		Type: types.EmptyMessage{}.Name(),
@@ -442,13 +458,15 @@ func (n *node) Upload(data io.Reader) (metahash string, err error) {
 	metahash = hex.EncodeToString(metahashBytes[:])
 	blobStore.Set(metahash, []byte(strings.Join(chunkHashHexes, peer.MetafileSep)))
 
+	n.logger.Info().Str("metahash", metahash).Msgf("file uploaded")
 	return metahash, nil
 }
 
 // implements peer.DataSharing
 func (n *node) Download(metahash string) ([]byte, error) {
-	var file []byte
+	n.logger.Info().Str("metahash", metahash).Msgf("file downloading")
 
+	var file []byte
 	dataCh, errCh := n.download(metahash)
 	var metafile []byte
 	select {
@@ -468,6 +486,8 @@ func (n *node) Download(metahash string) ([]byte, error) {
 
 	chunkHashHexes := strings.Split(string(metafile), peer.MetafileSep)
 
+	// In the real world, several chunks can be downloaded in parallel, however,
+	// for the purposes of this homework, the sequential approach must be used.
 	for _, chunkHashHex := range chunkHashHexes {
 		dataCh, errCh := n.download(chunkHashHex)
 		select {
@@ -528,6 +548,9 @@ func (n *node) download(hash string) (dataCh chan []byte, errCh chan error) {
 		RequestID: xid.New().String(),
 		Key:       hash,
 	}
+	n.logger.Trace().Str("hash", hash).
+		Str("request_id", req.RequestID).
+		Msgf("downloading remotely, backoff %v", n.conf.BackoffDataRequest)
 	msg := n.getMarshalledMsg(&req)
 	hdr := transport.NewHeader(n.getAddr(), n.getAddr(), peer, 0)
 	pkt := transport.Packet{
@@ -558,6 +581,7 @@ func (n *node) download(hash string) (dataCh chan []byte, errCh chan error) {
 				return
 			} else {
 				dataCh <- data
+				blobStore.Set(hash, data)
 				return
 			}
 		}
@@ -569,12 +593,14 @@ func (n *node) download(hash string) (dataCh chan []byte, errCh chan error) {
 
 // implements peer.DataSharing
 func (n *node) Tag(name string, mh string) error {
-	panic("not implemented") // TODO: Implement
+	n.conf.Storage.GetNamingStore().Set(name, []byte(mh))
+	return nil
 }
 
 // implements peer.DataSharing
 func (n *node) Resolve(name string) (metahash string) {
-	panic("not implemented") // TODO: Implement
+	value := n.conf.Storage.GetNamingStore().Get(name)
+	return string(value)
 }
 
 // implements peer.DataSharing
@@ -589,10 +615,225 @@ func (n *node) UpdateCatalog(key string, peer string) {
 
 // implements peer.DataSharing
 func (n *node) SearchAll(reg regexp.Regexp, budget uint, timeout time.Duration) (names []string, err error) {
-	panic("not implemented") // TODO: Implement
+	// if budget == 0 {
+	// 	return nil, fmt.Errorf("budget must be greater than 0")
+	// }
+	n.logger.Info().Msgf("searching for %v", reg.String())
+
+	namesMap := make(map[string]struct{})
+
+	for _, fileInfo := range n.searchLocal(&reg, true) {
+		namesMap[fileInfo.Name] = struct{}{}
+	}
+	n.logger.Trace().Msgf("search local result: %v", namesMap)
+
+	searchReplyCh, requestId, err := n.searchRemote(reg.String(), budget)
+	defer n.searchReplyCh.Delete(requestId)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.TODO())
+
+	// collect and merge replies
+	go func() {
+		for i := 0; i < int(budget); i++ {
+			select {
+			case reply := <-searchReplyCh:
+				for _, fileInfo := range reply {
+					namesMap[fileInfo.Name] = struct{}{}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+		cancel()
+	}()
+
+	select {
+	case <-time.After(timeout):
+		cancel()
+	case <-ctx.Done():
+	}
+
+	for name := range namesMap {
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// Divides the provided budget as evenly as possible among its neighbors. The node itself is not included.
+func (n *node) divideBudget(budget uint, upstream string) map[string]uint {
+	if budget == 0 {
+		return nil
+	}
+	m := make(map[string]uint)
+	neighbors := n.neighbors.getAll()
+
+	if upstream != "" {
+		// remove upstream from neighbors
+		for i, neighbor := range neighbors {
+			if neighbor == upstream {
+				neighbors = append(neighbors[:i], neighbors[i+1:]...)
+				break
+			}
+		}
+	}
+	if budget <= uint(len(neighbors)) {
+		for i := 0; i < int(budget); i++ {
+			m[neighbors[i]] = 1
+		}
+	} else {
+		for i := 0; i < len(neighbors); i++ {
+			m[neighbors[i]] = budget / uint(len(neighbors))
+			if i == len(neighbors)-1 {
+				m[neighbors[i]] -= budget % uint(len(neighbors))
+			}
+		}
+	}
+	return m
+}
+
+func (n *node) searchLocal(regexp *regexp.Regexp, includeNonexistent bool) []types.FileInfo {
+	blobstore := n.conf.Storage.GetDataBlobStore()
+	var fileInfos []types.FileInfo
+
+	n.conf.Storage.GetNamingStore().ForEach(
+		func(name string, metahash []byte) (continued bool) {
+			if regexp.Match([]byte(name)) {
+				// get metafile and chunks only locally
+				metafile := blobstore.Get(string(metahash))
+				if metafile == nil {
+					if includeNonexistent {
+						fileInfos = append(fileInfos, types.FileInfo{
+							Name:     name,
+							Metahash: string(metahash),
+						})
+					} else {
+						return true
+					}
+				}
+
+				chunkHashes := strings.Split(string(metafile), peer.MetafileSep)
+				var chunks [][]byte
+				for _, chunkHash := range chunkHashes {
+					chunk := blobstore.Get(chunkHash)
+					if chunk != nil {
+						chunks = append(chunks, []byte(chunkHash))
+					} else {
+						chunks = append(chunks, nil)
+					}
+				}
+				fileInfos = append(fileInfos, types.FileInfo{
+					Name:     name,
+					Metahash: string(metahash),
+					Chunks:   chunks,
+				})
+
+			}
+			return true
+		},
+	)
+	return fileInfos
+}
+
+// should delete requestId from n.searchReplyCh when the search is done or aborted
+func (n *node) searchRemote(reg string, budget uint) (searchReplyCh chan []types.FileInfo, requestId string, err error) {
+	requestId = xid.New().String()
+	searchReq := types.SearchRequestMessage{
+		RequestID: requestId,
+		Pattern:   reg,
+		Origin:    n.getAddr(),
+	}
+	searchReplyCh = make(chan []types.FileInfo, budget)
+	n.searchReplyCh.Store(searchReq.RequestID, searchReplyCh)
+	n.handledSearchReq.Store(searchReq.RequestID, nil)
+
+	division := n.divideBudget(budget, "")
+	n.logger.Trace().
+		Str("requestID", searchReq.RequestID).
+		Msgf("searching remote, budget division %v", division)
+	for neighbor, bgt := range division {
+		req := searchReq
+		req.Budget = bgt
+		msg := n.getMarshalledMsg(&req)
+		hdr := transport.NewHeader(n.getAddr(), n.getAddr(), neighbor, 0)
+		pkt := transport.Packet{
+			Header: &hdr,
+			Msg:    msg,
+		}
+
+		if err := n.conf.Socket.Send(neighbor, pkt, SocketTimeout); err != nil {
+			return nil, "", fmt.Errorf("failed to send search request: %v", err)
+		}
+	}
+
+	return
 }
 
 // implements peer.DataSharing
 func (n *node) SearchFirst(pattern regexp.Regexp, conf peer.ExpandingRing) (name string, err error) {
-	panic("not implemented") // TODO: Implement
+	fileInfos := n.searchLocal(&pattern, false)
+	for _, fileInfo := range fileInfos {
+		found := true
+		for _, chunk := range fileInfo.Chunks {
+			if chunk == nil {
+				found = false
+				break
+			}
+		}
+		if found {
+			return fileInfo.Name, nil
+		}
+	}
+
+	patternStr := pattern.String()
+	for i := 0; i < int(conf.Retry); i++ {
+		searchReplyCh, requestId, err := n.searchRemote(patternStr, conf.Initial)
+		defer n.searchReplyCh.Delete(requestId)
+		if err != nil {
+			return "", err
+		}
+
+		ctx, cancel := context.WithCancel(context.TODO())
+		res := make(chan string, 1)
+
+		// collect and check replies
+		go func() {
+			for i := 0; i < int(conf.Initial); i++ {
+				select {
+				case reply := <-searchReplyCh:
+					for _, fileInfo := range reply {
+						found := true
+						for _, chunk := range fileInfo.Chunks {
+							if chunk == nil {
+								found = false
+								break
+							}
+						}
+						if found {
+							res <- fileInfo.Name
+							return
+						}
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+			cancel()
+		}()
+
+		select {
+		case <-time.After(conf.Timeout):
+			cancel()
+		case name := <-res:
+			return name, nil
+		case <-ctx.Done():
+		}
+
+		conf.Initial *= conf.Factor
+	}
+
+	n.logger.Info().Msgf("timeout, file not found")
+	return "", nil
 }
