@@ -40,7 +40,7 @@ func (ns *neighbors) getAll() []string {
 	ns.Lock()
 	defer ns.Unlock()
 
-	return ns.data[:]
+	return append([]string{}, ns.data...)
 }
 
 func (ns *neighbors) getRandom() string {
