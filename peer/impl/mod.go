@@ -633,27 +633,29 @@ func (n *node) SearchAll(reg regexp.Regexp, budget uint, timeout time.Duration) 
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(context.TODO())
+	canceled := make(chan struct{})
+	done := make(chan struct{})
 
 	// collect and merge replies
 	go func() {
+		defer close(done)
 		for i := 0; i < int(budget); i++ {
 			select {
 			case reply := <-searchReplyCh:
 				for _, fileInfo := range reply {
 					namesMap[fileInfo.Name] = struct{}{}
 				}
-			case <-ctx.Done():
+			case <-canceled:
 				return
 			}
 		}
-		cancel()
 	}()
 
 	select {
 	case <-time.After(timeout):
-		cancel()
-	case <-ctx.Done():
+		close(canceled)
+		<-done
+	case <-done:
 	}
 
 	for name := range namesMap {
@@ -795,11 +797,12 @@ func (n *node) SearchFirst(pattern regexp.Regexp, conf peer.ExpandingRing) (name
 			return "", err
 		}
 
-		ctx, cancel := context.WithCancel(context.TODO())
+		canceled := make(chan struct{})
 		res := make(chan string, 1)
 
 		// collect and check replies
 		go func() {
+			defer close(res)
 			for i := 0; i < int(conf.Initial); i++ {
 				select {
 				case reply := <-searchReplyCh:
@@ -816,19 +819,20 @@ func (n *node) SearchFirst(pattern regexp.Regexp, conf peer.ExpandingRing) (name
 							return
 						}
 					}
-				case <-ctx.Done():
+				case <-canceled:
 					return
 				}
 			}
-			cancel()
 		}()
 
 		select {
 		case <-time.After(conf.Timeout):
-			cancel()
-		case name := <-res:
-			return name, nil
-		case <-ctx.Done():
+			close(canceled)
+			<-res
+		case name, ok := <-res:
+			if ok {
+				return name, nil
+			}
 		}
 
 		conf.Initial *= conf.Factor
