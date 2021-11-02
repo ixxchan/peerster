@@ -370,9 +370,7 @@ func (n *node) getAddr() string {
 func (n *node) heartbeat() {
 	// We don't need to wait until the node has a peer, thanks to the anti-entropy mechanism
 
-	msg := transport.Message{
-		Type: types.EmptyMessage{}.Name(),
-	}
+	msg := *n.getMarshalledMsg(types.EmptyMessage{})
 
 	for {
 		err := n.Broadcast(msg)
