@@ -52,6 +52,7 @@ func (c *controller) rumorsHandler(m types.Message, p transport.Packet) error {
 
 		if p.Header.Source == c.node.getAddr() {
 			if err := c.node.conf.MessageRegistry.ProcessPacket(newPkt); err != nil {
+				c.node.rumorsMu.Unlock()
 				return err
 			}
 		} else {
@@ -396,7 +397,11 @@ func logging(logger *zerolog.Logger) func(registry.Exec) registry.Exec {
 				return next(m, p)
 			}
 			newlogger.Info().Msgf("process message: %v", m.String())
-			return next(m, p)
+			if err := next(m, p) ;err!=nil{
+				newlogger.Error().Msgf("error when processing message: %v", err)
+				return err
+			}
+			return nil
 		}
 	}
 }

@@ -94,11 +94,28 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 		ctx:        ctx,
 		cancelFunc: cancelFunc,
 	}
+	// initialize logger first, so that other components can use it
 	node.logger = zerolog.New(logout).Level(level).With().
 		Timestamp().
 		Caller().
 		Str("role", "node").
 		Str("myaddr", node.getAddr()).Logger()
+
+	tlc := TLC{}
+	node.proposer = Proposer{
+		n:      node,
+		tlc:    &tlc,
+		currID: conf.PaxosID,
+		retry: conf.PaxosProposerRetry,
+	}
+	acceptor := Acceptor{
+		n:             node,
+		tlc:           &tlc,
+		maxID:         0,
+		acceptedID:    0,
+		acceptedValue: nil,
+	}
+	
 
 	ctrl := NewController(node)
 	conf.MessageRegistry.RegisterMessageCallback(types.ChatMessage{}, logging(&node.logger)(ctrl.chatHandler))
@@ -113,6 +130,12 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 	conf.MessageRegistry.RegisterMessageCallback(types.DataReplyMessage{}, logging(&node.logger)(ctrl.dataReplyHandler))
 	conf.MessageRegistry.RegisterMessageCallback(types.SearchReplyMessage{}, logging(&node.logger)(ctrl.searchReplyHandler))
 	conf.MessageRegistry.RegisterMessageCallback(types.SearchRequestMessage{}, logging(&node.logger)(ctrl.searchRequestHandler))
+
+	conf.MessageRegistry.RegisterMessageCallback(types.PaxosPrepareMessage{}, logging(&node.logger)(acceptor.prepareHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.PaxosProposeMessage{}, logging(&node.logger)(acceptor.proposeHandler))
+	// TODO: proposer
+	conf.MessageRegistry.RegisterMessageCallback(types.PaxosAcceptMessage{}, logging(&node.logger)(ctrl.emptyHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.PaxosPromiseMessage{}, logging(&node.logger)(ctrl.emptyHandler))
 
 	// routingTable[myAddr] = myAddr
 	node.AddPeer(conf.Socket.GetAddress())
@@ -166,6 +189,9 @@ type node struct {
 	// RequestID -> []FileInfo
 	searchReplyCh    sync.Map
 	handledSearchReq sync.Map
+
+	// ******** paxos fields ********
+	proposer Proposer
 }
 
 // Start implements peer.Service
@@ -273,7 +299,7 @@ func (n *node) Broadcast(msg transport.Message) error {
 
 	// sends the rumor to a random neighbor.
 	if n.neighbors.len() == 0 {
-		n.logger.Info().Msgf("has none neighbors to broadcast")
+		n.logger.Warn().Msgf("has none neighbors to broadcast")
 		return nil
 	}
 	neighbor := n.neighbors.getRandom()
