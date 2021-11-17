@@ -316,6 +316,9 @@ func newProposer(n *node, tlc *TLC, conf peer.Configuration) *Proposer {
 
 // Returns when observed a consensus reached (not necessarily the same as the proposed value)
 func (p *Proposer) prepareAndPropose(value types.PaxosValue) error {
+	p.mu.Lock()
+	consensusCh := p.consensusCh
+	p.mu.Unlock()
 	for {
 		if err := p.prepare(); err != nil {
 			return err
@@ -328,7 +331,7 @@ func (p *Proposer) prepareAndPropose(value types.PaxosValue) error {
 		select {
 		case <-p.n.ctx.Done():
 			return nil
-		case <-p.consensusCh:
+		case <-consensusCh:
 			return nil
 		case <-time.After(p.retry):
 		}
@@ -513,6 +516,8 @@ func (a *Acceptor) prepareHandler(m types.Message, p transport.Packet) error {
 
 func (a *Acceptor) proposeHandler(m types.Message, p transport.Packet) error {
 	propose := m.(*types.PaxosProposeMessage)
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if propose.Step != a.tlc.GetCurrStep() {
 		a.n.logger.Info().Msgf("TLC step mismatch: from %s, step %d, currStep %d", p.Header.Source, propose.Step, a.tlc.GetCurrStep())
 		return nil
