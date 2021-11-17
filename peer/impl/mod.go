@@ -46,6 +46,7 @@ var level = defaultLevel
 var logout io.Writer = zerolog.ConsoleWriter{
 	Out:        os.Stdout,
 	TimeFormat: time.RFC3339,
+	NoColor:    true,
 }
 
 func init() {
@@ -101,21 +102,7 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 		Str("role", "node").
 		Str("myaddr", node.getAddr()).Logger()
 
-	tlc := TLC{}
-	node.proposer = Proposer{
-		n:      node,
-		tlc:    &tlc,
-		currID: conf.PaxosID,
-		retry: conf.PaxosProposerRetry,
-	}
-	acceptor := Acceptor{
-		n:             node,
-		tlc:           &tlc,
-		maxID:         0,
-		acceptedID:    0,
-		acceptedValue: nil,
-	}
-	
+	node.multiPaxos = NewMultiPaxos(node, conf)
 
 	ctrl := NewController(node)
 	conf.MessageRegistry.RegisterMessageCallback(types.ChatMessage{}, logging(&node.logger)(ctrl.chatHandler))
@@ -131,11 +118,12 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 	conf.MessageRegistry.RegisterMessageCallback(types.SearchReplyMessage{}, logging(&node.logger)(ctrl.searchReplyHandler))
 	conf.MessageRegistry.RegisterMessageCallback(types.SearchRequestMessage{}, logging(&node.logger)(ctrl.searchRequestHandler))
 
-	conf.MessageRegistry.RegisterMessageCallback(types.PaxosPrepareMessage{}, logging(&node.logger)(acceptor.prepareHandler))
-	conf.MessageRegistry.RegisterMessageCallback(types.PaxosProposeMessage{}, logging(&node.logger)(acceptor.proposeHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.PaxosPrepareMessage{}, logging(&node.logger)(node.multiPaxos.prepareHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.PaxosProposeMessage{}, logging(&node.logger)(node.multiPaxos.proposeHandler))
 	// TODO: proposer
-	conf.MessageRegistry.RegisterMessageCallback(types.PaxosAcceptMessage{}, logging(&node.logger)(ctrl.emptyHandler))
-	conf.MessageRegistry.RegisterMessageCallback(types.PaxosPromiseMessage{}, logging(&node.logger)(ctrl.emptyHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.PaxosAcceptMessage{}, logging(&node.logger)(node.multiPaxos.acceptHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.PaxosPromiseMessage{}, logging(&node.logger)(node.multiPaxos.promiseHandler))
+	conf.MessageRegistry.RegisterMessageCallback(types.TLCMessage{}, logging(&node.logger)(node.multiPaxos.tlcHandler))
 
 	// routingTable[myAddr] = myAddr
 	node.AddPeer(conf.Socket.GetAddress())
@@ -191,7 +179,7 @@ type node struct {
 	handledSearchReq sync.Map
 
 	// ******** paxos fields ********
-	proposer Proposer
+	multiPaxos MultiPaxos
 }
 
 // Start implements peer.Service
@@ -616,9 +604,32 @@ func (n *node) download(hash string) (dataCh chan []byte, errCh chan error) {
 }
 
 // implements peer.DataSharing
+//
+// This API is blocking, and calling it concurrently is undefined behavior.
 func (n *node) Tag(name string, mh string) error {
-	n.conf.Storage.GetNamingStore().Set(name, []byte(mh))
-	return nil
+	namingStore := n.conf.Storage.GetNamingStore()
+	for {
+		if namingStore.Get(name) != nil {
+			n.logger.Error().Msgf("name already exists: %v", name)
+			return fmt.Errorf("name already exists")
+		}
+
+		value, err := n.multiPaxos.PrepareAndPropose(types.PaxosValue{
+			UniqID:   xid.New().String(),
+			Filename: name,
+			Metahash: mh,
+		})
+
+		if err != nil {
+			n.logger.Error().Msgf("failed to prepare and propose: %v", err)
+			return fmt.Errorf("failed to prepare and propose: %v", err)
+		}
+
+		if value.Filename == name {
+			n.logger.Info().Msgf("tagged: %v", name)
+			return nil
+		}
+	}
 }
 
 // implements peer.DataSharing

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"regexp"
+	"runtime/debug"
 
 	"github.com/rs/zerolog"
 	"go.dedis.ch/cs438/registry"
@@ -49,14 +50,19 @@ func (c *controller) rumorsHandler(m types.Message, p transport.Packet) error {
 			Header: p.Header,
 			Msg:    rumor.Msg,
 		}
-
+		
+		c.node.logger.Trace().Msgf("processing rumor %v", rumor)
 		if p.Header.Source == c.node.getAddr() {
 			if err := c.node.conf.MessageRegistry.ProcessPacket(newPkt); err != nil {
 				c.node.rumorsMu.Unlock()
 				return err
 			}
 		} else {
-			go c.node.conf.MessageRegistry.ProcessPacket(newPkt)
+			go func() {
+				if err := c.node.conf.MessageRegistry.ProcessPacket(newPkt); err != nil {
+					c.node.logger.Error().Msgf("failed to process packet: %v", err)
+				}
+			}()
 		}
 
 		c.node.status[rumor.Origin]++
@@ -390,6 +396,14 @@ func logging(logger *zerolog.Logger) func(registry.Exec) registry.Exec {
 			if ignoreMsgTypeInLog()[p.Msg.Type] {
 				newlogger = newlogger.Level(zerolog.Disabled)
 			}
+
+			defer func() {
+				if v := recover(); v != nil {
+					logger.Error().Msgf("panic: %v\nstack: %v", v, string(debug.Stack()))
+					panic(v)
+				}
+			}()
+
 			if m == nil {
 				if p.Msg.Type != "empty" {
 					newlogger.Warn().Msgf("nil message")
@@ -397,7 +411,7 @@ func logging(logger *zerolog.Logger) func(registry.Exec) registry.Exec {
 				return next(m, p)
 			}
 			newlogger.Info().Msgf("process message: %v", m.String())
-			if err := next(m, p) ;err!=nil{
+			if err := next(m, p); err != nil {
 				newlogger.Error().Msgf("error when processing message: %v", err)
 				return err
 			}
