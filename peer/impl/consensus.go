@@ -51,25 +51,24 @@ func (mp *MultiPaxos) getInstance() (*Proposer, *Acceptor) {
 	return mp.p, mp.a
 }
 
-func (mp *MultiPaxos) advanceInstance() {
+func (mp *MultiPaxos) advanceInstance(step uint) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
-	mp.p, mp.a = newPaxosInstance(mp.node, mp.tlc.GetCurrStep(), mp.conf)
+	mp.p, mp.a = newPaxosInstance(mp.node, step, mp.conf)
 }
 
 func (mp *MultiPaxos) PrepareAndPropose(value types.PaxosValue) (*types.PaxosValue, error) {
 	p, _ := mp.getInstance()
 	mp.tlc.mu.Lock()
-	step:= mp.tlc.currStep
-	advanceCh := make(chan struct{}, 1)
+	advanceCh := make(chan types.PaxosValue, 1)
 	mp.tlc.advanceCh = advanceCh
 	mp.tlc.mu.Unlock()
 	if err := p.prepareAndPropose(value); err != nil {
 		return nil, err
 	}
 	// block until TLC advances, so that we move to the next instance
-	<-advanceCh
-	return &mp.tlc.received[step].block.Value, nil
+	v:=<-advanceCh
+	return &v, nil
 }
 
 func (mp *MultiPaxos) prepareHandler(m types.Message, p transport.Packet) error {
@@ -91,6 +90,8 @@ func (mp *MultiPaxos) acceptHandler(m types.Message, pkt transport.Packet) error
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	step := p.step
 
@@ -143,7 +144,7 @@ type TLC struct {
 	}
 	sent      bool
 	mu        sync.Mutex
-	advanceCh chan struct{}
+	advanceCh chan types.PaxosValue
 
 	p  *Proposer
 	mp *MultiPaxos
@@ -175,9 +176,9 @@ func (t *TLC) GetCurrStep() uint {
 func (t *TLC) advanceCurrStep() {
 	t.currStep++
 	t.sent = false
-	t.mp.advanceInstance()
+	t.mp.advanceInstance(t.currStep)
 	select {
-	case t.advanceCh <- struct{}{}:
+	case t.advanceCh <- t.received[t.currStep-1].block.Value:
 	default:
 	}
 }
