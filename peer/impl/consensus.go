@@ -15,7 +15,7 @@ import (
 	"go.dedis.ch/cs438/types"
 )
 
-// TODO: make the relationship between TLC and MultiPaxos more clear 
+// TODO: make the relationship between TLC and MultiPaxos more clear
 // FIXME: catch up is not working
 type MultiPaxos struct {
 	node *node
@@ -58,8 +58,9 @@ func (mp *MultiPaxos) advanceInstance() {
 }
 
 func (mp *MultiPaxos) PrepareAndPropose(value types.PaxosValue) (*types.PaxosValue, error) {
-	p, a := mp.getInstance()
+	p, _ := mp.getInstance()
 	mp.tlc.mu.Lock()
+	step:= mp.tlc.currStep
 	advanceCh := make(chan struct{}, 1)
 	mp.tlc.advanceCh = advanceCh
 	mp.tlc.mu.Unlock()
@@ -68,8 +69,7 @@ func (mp *MultiPaxos) PrepareAndPropose(value types.PaxosValue) (*types.PaxosVal
 	}
 	// block until TLC advances, so that we move to the next instance
 	<-advanceCh
-	mp.advanceInstance()
-	return a.acceptedValue, nil
+	return &mp.tlc.received[step].block.Value, nil
 }
 
 func (mp *MultiPaxos) prepareHandler(m types.Message, p transport.Packet) error {
@@ -175,6 +175,7 @@ func (t *TLC) GetCurrStep() uint {
 func (t *TLC) advanceCurrStep() {
 	t.currStep++
 	t.sent = false
+	t.mp.advanceInstance()
 	select {
 	case t.advanceCh <- struct{}{}:
 	default:
