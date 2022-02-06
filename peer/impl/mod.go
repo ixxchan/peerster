@@ -179,7 +179,7 @@ type node struct {
 	handledSearchReq sync.Map
 
 	// ******** paxos fields ********
-	multiPaxos MultiPaxos
+	multiPaxos *MultiPaxos
 }
 
 // Start implements peer.Service
