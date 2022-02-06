@@ -6,9 +6,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
-	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/sasha-s/go-deadlock"
 	"go.dedis.ch/cs438/peer"
 	"go.dedis.ch/cs438/storage"
 	"go.dedis.ch/cs438/transport"
@@ -16,29 +17,45 @@ import (
 )
 
 // TODO: make the relationship between TLC and MultiPaxos more clear
-// FIXME: catch up is not working
 type MultiPaxos struct {
 	node *node
 	conf peer.Configuration
 
-	mu  sync.Mutex
+	mu  deadlock.Mutex
 	tlc *TLC
 	p   *Proposer
 	a   *Acceptor
+
+	doneCh chan<- struct{}
 }
 
 func NewMultiPaxos(n *node, conf peer.Configuration) *MultiPaxos {
-	tlc := NewTLC(n, conf)
-	p, a := newPaxosInstance(n, tlc.currStep, conf)
+	tlc := &TLC{
+		n:         n,
+		currStep:  0,
+		threshold: conf.PaxosThreshold(conf.TotalPeers),
+
+		blockchain:  conf.Storage.GetBlockchainStore(),
+		namingStore: conf.Storage.GetNamingStore(),
+		received: make(map[uint]struct {
+			cnt   *int
+			block *types.BlockchainBlock
+		}),
+
+		advanceCh: []chan types.PaxosValue{make(chan types.PaxosValue, 1)},
+	}
+	doneCh := make(chan struct{})
+	p, a := newPaxosInstance(n, tlc.currStep, conf, doneCh)
 	tlc.p = p
 
 	mp := &MultiPaxos{
 		node: n,
 		conf: conf,
 
-		tlc: tlc,
-		p:   p,
-		a:   a,
+		tlc:    tlc,
+		p:      p,
+		a:      a,
+		doneCh: doneCh,
 	}
 
 	tlc.mp = mp
@@ -54,75 +71,50 @@ func (mp *MultiPaxos) getInstance() (*Proposer, *Acceptor) {
 func (mp *MultiPaxos) advanceInstance(step uint) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
-	mp.p, mp.a = newPaxosInstance(mp.node, step, mp.conf)
+	close(mp.doneCh)
+
+	doneCh := make(chan struct{})
+	mp.doneCh = doneCh
+	mp.p, mp.a = newPaxosInstance(mp.node, step, mp.conf, doneCh)
 }
 
 func (mp *MultiPaxos) PrepareAndPropose(value types.PaxosValue) (*types.PaxosValue, error) {
 	p, _ := mp.getInstance()
 	mp.tlc.mu.Lock()
-	advanceCh := make(chan types.PaxosValue, 1)
-	mp.tlc.advanceCh = advanceCh
+	advanceCh := mp.tlc.advanceCh[p.step]
 	mp.tlc.mu.Unlock()
 	if err := p.prepareAndPropose(value); err != nil {
 		return nil, err
 	}
 	// block until TLC advances, so that we move to the next instance
-	v:=<-advanceCh
+	v := <-advanceCh
 	return &v, nil
 }
 
 func (mp *MultiPaxos) prepareHandler(m types.Message, p transport.Packet) error {
 	_, a := mp.getInstance()
-
 	return a.prepareHandler(m, p)
 }
 
 func (mp *MultiPaxos) proposeHandler(m types.Message, p transport.Packet) error {
 	_, a := mp.getInstance()
-
 	return a.proposeHandler(m, p)
 }
 
 func (mp *MultiPaxos) acceptHandler(m types.Message, pkt transport.Packet) error {
-	p, a := mp.getInstance()
-
-	accept := m.(*types.PaxosAcceptMessage)
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	step := p.step
-
-	// outdated promise
-	if accept.Step != step {
-		p.logger.Info().Msgf("TLC step mismatch: from %s, step %d, currStep %d", pkt.Header.Source, accept.Step, step)
-		return nil
+	p, _ := mp.getInstance()
+	decided, err := p.acceptHandler(m, pkt)
+	if err != nil {
+		return err
 	}
-	// Note: should use acceptor's maxID instead of proposer's currID, in case the node didn't propose.
-	// This is also why we do not use p.acceptHandler
-	if accept.ID != a.maxID {
-		p.logger.Info().Msgf("ID %d != maxID %d", accept.ID, a.maxID)
-		return nil
+	if decided != nil {
+		mp.tlc.Broadcast(decided)
 	}
-
-	p.acceptCnt[accept.Value.UniqID]++
-	if p.acceptCnt[accept.Value.UniqID] >= p.threshold {
-		// consensus reached
-		select {
-		case p.consensusCh <- struct{}{}:
-		default:
-		}
-		mp.tlc.Broadcast(&accept.Value, step)
-	}
-
 	return nil
 }
 
 func (mp *MultiPaxos) promiseHandler(m types.Message, pkt transport.Packet) error {
 	p, _ := mp.getInstance()
-
 	return p.promiseHandler(m, pkt)
 }
 
@@ -143,33 +135,11 @@ type TLC struct {
 		block *types.BlockchainBlock
 	}
 	sent      bool
-	mu        sync.Mutex
-	advanceCh chan types.PaxosValue
+	mu        deadlock.Mutex
+	advanceCh []chan types.PaxosValue
 
 	p  *Proposer
 	mp *MultiPaxos
-}
-
-func NewTLC(n *node, conf peer.Configuration) *TLC {
-	return &TLC{
-		n:         n,
-		currStep:  0,
-		threshold: conf.PaxosThreshold(conf.TotalPeers),
-
-		blockchain:  conf.Storage.GetBlockchainStore(),
-		namingStore: conf.Storage.GetNamingStore(),
-		received: make(map[uint]struct {
-			cnt   *int
-			block *types.BlockchainBlock
-		}),
-	}
-}
-
-func (t *TLC) GetCurrStep() uint {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	return t.currStep
 }
 
 // grab lock before calling
@@ -177,10 +147,8 @@ func (t *TLC) advanceCurrStep() {
 	t.currStep++
 	t.sent = false
 	t.mp.advanceInstance(t.currStep)
-	select {
-	case t.advanceCh <- t.received[t.currStep-1].block.Value:
-	default:
-	}
+	t.advanceCh = append(t.advanceCh, make(chan types.PaxosValue, 1))
+	t.advanceCh[t.currStep-1] <- t.received[t.currStep-1].block.Value
 }
 
 // grab lock before calling
@@ -194,18 +162,15 @@ func (t *TLC) broadcast(block *types.BlockchainBlock) {
 }
 
 // called when consuses is reached
-func (t *TLC) Broadcast(value *types.PaxosValue, step uint) {
+func (t *TLC) Broadcast(value *types.PaxosValue) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if step != t.currStep || t.sent {
-		return
-	}
 	t.sent = true
 
 	block := types.BlockchainBlock{
 		Value:    *value,
-		Index:    step,
+		Index:    t.currStep,
 		PrevHash: t.blockchain.Get(storage.LastBlockKey),
 	}
 
@@ -232,9 +197,7 @@ func (t *TLC) tlcHandler(m types.Message, pkt transport.Packet) error {
 	msg := m.(*types.TLCMessage)
 
 	// grab lock before get step, since the msg may advance step
-	t.n.logger.Trace().Msgf("tlcHandler grabbing lock")
 	t.mu.Lock()
-	t.n.logger.Trace().Msgf("tlcHandler got lock")
 	defer t.mu.Unlock()
 
 	currStep := t.currStep
@@ -310,7 +273,7 @@ func (t *TLC) tlcHandler(m types.Message, pkt transport.Packet) error {
 	}
 }
 
-func newPaxosInstance(n *node, step uint, conf peer.Configuration) (*Proposer, *Acceptor) {
+func newPaxosInstance(n *node, step uint, conf peer.Configuration, doneCh <-chan struct{}) (*Proposer, *Acceptor) {
 	p := &Proposer{
 		node:       n,
 		retry:      conf.PaxosProposerRetry,
@@ -320,9 +283,10 @@ func newPaxosInstance(n *node, step uint, conf peer.Configuration) (*Proposer, *
 		step:   step,
 		currID: conf.PaxosID,
 
-		mu:          sync.Mutex{},
+		mu:          deadlock.Mutex{},
 		acceptCnt:   make(map[string]int),
 		consensusCh: make(chan struct{}, 1),
+		doneCh:      doneCh,
 	}
 	a := &Acceptor{
 		node:          n,
@@ -330,6 +294,7 @@ func newPaxosInstance(n *node, step uint, conf peer.Configuration) (*Proposer, *
 		maxID:         0,
 		acceptedID:    0,
 		acceptedValue: nil,
+		doneCh:        doneCh,
 	}
 	return p, a
 }
@@ -344,15 +309,19 @@ type Proposer struct {
 	step   uint
 	currID uint
 
-	mu          sync.Mutex
+	mu          deadlock.Mutex
 	promiseCh   chan struct{}
 	acceptCnt   map[string]int
 	consensusCh chan struct{}
+
+	proposing bool
+	doneCh    <-chan struct{} // This instance is passed
 }
 
 // Returns when observed a consensus reached (not necessarily the same as the proposed value)
 func (p *Proposer) prepareAndPropose(value types.PaxosValue) error {
 	p.mu.Lock()
+	p.proposing = true
 	consensusCh := p.consensusCh
 	p.mu.Unlock()
 	for {
@@ -369,6 +338,8 @@ func (p *Proposer) prepareAndPropose(value types.PaxosValue) error {
 			return nil
 		case <-consensusCh:
 			return nil
+		case <-p.doneCh:
+			return nil
 		case <-time.After(p.retry):
 		}
 
@@ -381,9 +352,8 @@ func (p *Proposer) prepareAndPropose(value types.PaxosValue) error {
 // prepare until threshold promises are collected
 func (p *Proposer) prepare() error {
 	p.mu.Lock()
-	currStep := p.step
 	prepare := types.PaxosPrepareMessage{
-		Step:   currStep,
+		Step:   p.step,
 		ID:     p.currID,
 		Source: p.getAddr(),
 	}
@@ -398,12 +368,15 @@ func (p *Proposer) prepare() error {
 	}
 
 	for !p.collectPromises(promiseCh) {
+		select {
+		case <-p.ctx.Done():
+			return nil
+		case <-p.doneCh:
+			return nil
+		default:
+		}
 		p.logger.Trace().Msg("retry prepare")
 		p.mu.Lock()
-		if p.step != currStep {
-			p.mu.Unlock()
-			return nil
-		}
 		p.currID += p.totalPeers
 		prepare.ID = p.currID
 		promiseCh = make(chan struct{}, p.threshold)
@@ -421,6 +394,7 @@ func (p *Proposer) prepare() error {
 func (p *Proposer) collectPromises(ch <-chan struct{}) bool {
 	done := make(chan struct{})
 	cancel := make(chan struct{})
+	 var cnt int32
 	go func() {
 		// collect threshold promises
 		for i := 0; i < p.threshold; i++ {
@@ -428,6 +402,7 @@ func (p *Proposer) collectPromises(ch <-chan struct{}) bool {
 			case <-cancel:
 				return
 			case <-ch:
+			atomic.AddInt32(&cnt, 1)
 			}
 		}
 		close(done)
@@ -439,7 +414,7 @@ func (p *Proposer) collectPromises(ch <-chan struct{}) bool {
 		return true
 	case <-time.After(p.retry):
 		close(cancel)
-		p.logger.Trace().Msg("promises not enough")
+		p.logger.Trace().Msgf("promises not enough, collected %v/%v", atomic.LoadInt32(&cnt), p.threshold)
 		return false
 	}
 }
@@ -486,6 +461,39 @@ func (p *Proposer) promiseHandler(m types.Message, pkt transport.Packet) error {
 	return nil
 }
 
+func (p *Proposer) acceptHandler(m types.Message, pkt transport.Packet) (decided *types.PaxosValue, err error) {
+	accept := m.(*types.PaxosAcceptMessage)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	step := p.step
+
+	// outdated promise
+	if accept.Step != step {
+		p.logger.Info().Msgf("TLC step mismatch: from %s, step %d, currStep %d", pkt.Header.Source, accept.Step, step)
+		return nil, nil
+	}
+	// Note: If the node didn't propose, it will learn the result from TLC message.
+	// if !p.proposing {
+	// 	p.logger.Info().Msgf("Not proposing")
+	// 	return nil, nil
+	// }
+
+	p.acceptCnt[accept.Value.UniqID]++
+	p.logger.Trace().Msgf("Accepted %d times", p.acceptCnt[accept.Value.UniqID])
+	if p.acceptCnt[accept.Value.UniqID] >= p.threshold {
+		// consensus reached
+		p.logger.Info().Msgf("Consensus reached: %s", accept.Value.UniqID)
+		select {
+		case p.consensusCh <- struct{}{}:
+		default:
+		}
+		return &accept.Value, nil
+	}
+	return nil, nil
+}
+
 type Acceptor struct {
 	*node
 
@@ -495,7 +503,8 @@ type Acceptor struct {
 	acceptedID    uint
 	acceptedValue *types.PaxosValue
 
-	mu sync.Mutex
+	mu     deadlock.Mutex
+	doneCh <-chan struct{} // This instance is passed
 }
 
 func (a *Acceptor) prepareHandler(m types.Message, p transport.Packet) error {

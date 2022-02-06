@@ -46,7 +46,7 @@ var level = defaultLevel
 var logout io.Writer = zerolog.ConsoleWriter{
 	Out:        os.Stdout,
 	TimeFormat: time.RFC3339,
-	NoColor:    true,
+	NoColor:    false,
 }
 
 func init() {
@@ -305,7 +305,6 @@ func (n *node) Broadcast(msg transport.Message) error {
 	// wait for ack. If no ack, send to another neighbor
 	go func() {
 		if n.conf.AckTimeout == 0 {
-			n.logger.Debug().Msgf("broadcast wait for ack %v, neighbor %v", pkt.Header.PacketID, pkt.Header.Destination)
 			select {
 			case <-ackCh:
 				return
@@ -315,7 +314,6 @@ func (n *node) Broadcast(msg transport.Message) error {
 
 		}
 		for {
-			n.logger.Debug().Msgf("broadcast wait for ack %v, neighbor %v", pkt.Header.PacketID, pkt.Header.Destination)
 			select {
 			case <-ackCh:
 				return
