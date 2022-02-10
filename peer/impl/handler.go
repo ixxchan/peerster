@@ -41,7 +41,7 @@ func (c *controller) rumorsHandler(m types.Message, p transport.Packet) error {
 		}
 		newRumor = true
 
-		if !routingUpdated[rumor.Origin] && !c.node.neighbors.has(rumor.Origin) {
+		if rumor.Origin != c.node.getAddr() && !routingUpdated[rumor.Origin] && !c.node.neighbors.has(rumor.Origin) {
 			c.node.SetRoutingEntry(rumor.Origin, p.Header.RelayedBy)
 			routingUpdated[rumor.Origin] = true
 		}
@@ -50,7 +50,7 @@ func (c *controller) rumorsHandler(m types.Message, p transport.Packet) error {
 			Header: p.Header,
 			Msg:    rumor.Msg,
 		}
-		
+
 		c.node.logger.Trace().Msgf("processing rumor %v", rumor)
 		if p.Header.Source == c.node.getAddr() {
 			if err := c.node.conf.MessageRegistry.ProcessPacket(newPkt); err != nil {
@@ -58,11 +58,12 @@ func (c *controller) rumorsHandler(m types.Message, p transport.Packet) error {
 				return err
 			}
 		} else {
-			go func() {
-				if err := c.node.conf.MessageRegistry.ProcessPacket(newPkt); err != nil {
-					c.node.logger.Error().Msgf("failed to process packet: %v", err)
-				}
-			}()
+			// Catch up can be faster if process sequentially
+			// go func() {
+			if err := c.node.conf.MessageRegistry.ProcessPacket(newPkt); err != nil {
+				c.node.logger.Error().Msgf("failed to process packet: %v", err)
+			}
+			// }()
 		}
 
 		c.node.status[rumor.Origin]++
@@ -192,7 +193,6 @@ func (c *controller) ackHandler(m types.Message, p transport.Packet) error {
 		case ackCh <- struct{}{}:
 			close(ackCh)
 			c.node.ackCh.Delete(ack.AckedPacketID)
-			c.node.logger.Debug().Msgf("ack %v received", ack.AckedPacketID)
 		default:
 			c.node.logger.Warn().Str("packet_id", ack.AckedPacketID).Msgf("blocking ack")
 		}

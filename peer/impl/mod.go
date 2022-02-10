@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/rs/xid"
@@ -24,9 +23,11 @@ import (
 func ignoreMsgTypeInLog() map[string]bool {
 	empty := types.EmptyMessage{}
 	status := types.StatusMessage{}
+	ack := types.AckMessage{}
 	return map[string]bool{
 		empty.Name():  true,
 		status.Name(): true,
+		ack.Name():    true,
 	}
 }
 
@@ -120,7 +121,6 @@ func NewPeer(conf peer.Configuration) peer.Peer {
 
 	conf.MessageRegistry.RegisterMessageCallback(types.PaxosPrepareMessage{}, logging(&node.logger)(node.multiPaxos.prepareHandler))
 	conf.MessageRegistry.RegisterMessageCallback(types.PaxosProposeMessage{}, logging(&node.logger)(node.multiPaxos.proposeHandler))
-	// TODO: proposer
 	conf.MessageRegistry.RegisterMessageCallback(types.PaxosAcceptMessage{}, logging(&node.logger)(node.multiPaxos.acceptHandler))
 	conf.MessageRegistry.RegisterMessageCallback(types.PaxosPromiseMessage{}, logging(&node.logger)(node.multiPaxos.promiseHandler))
 	conf.MessageRegistry.RegisterMessageCallback(types.TLCMessage{}, logging(&node.logger)(node.multiPaxos.tlcHandler))
@@ -264,11 +264,12 @@ func (n *node) Unicast(dest string, msg transport.Message) error {
 
 // Broadcast implements peer.Messaging
 func (n *node) Broadcast(msg transport.Message) error {
-	seq := atomic.AddUint32(&n.seq, 1)
+	n.rumorsMu.Lock()
+	n.seq++
 	rumors := types.RumorsMessage{Rumors: []types.Rumor{
 		{
 			Origin:   n.getAddr(),
-			Sequence: uint(seq),
+			Sequence: uint(n.seq),
 			Msg:      &msg,
 		},
 	}}
@@ -279,11 +280,21 @@ func (n *node) Broadcast(msg transport.Message) error {
 		Header: &hdr,
 		Msg:    n.getMarshalledMsg(&rumors),
 	}
-	if err := n.conf.MessageRegistry.ProcessPacket(pkt); err != nil {
-		// Restore to the state before the operation
-		atomic.StoreUint32(&n.seq, seq-1)
-		return fmt.Errorf("failed to process rumor locally: %v", err)
+
+	// process rumors locally. do not use rumorsHandler to make sure ORDERED execution
+	msgPkt := transport.Packet{
+		Header: &hdr,
+		Msg:    &msg,
 	}
+	n.logger.Trace().Msgf("processing rumor locally %v", msg)
+	if err := n.conf.MessageRegistry.ProcessPacket(msgPkt); err != nil {
+		n.rumorsMu.Unlock()
+		return err
+	}
+	n.status[n.getAddr()]++
+	n.rumorsLog[n.getAddr()] = append(n.rumorsLog[n.getAddr()], rumors.Rumors[0])
+	n.rumorsMu.Unlock()
+	n.logger.Trace().Msgf("finish processing rumor locally %v", msg)
 
 	// sends the rumor to a random neighbor.
 	if n.neighbors.len() == 0 {
@@ -298,9 +309,9 @@ func (n *node) Broadcast(msg transport.Message) error {
 	n.ackCh.Store(pkt.Header.PacketID, ackCh)
 
 	if err := n.conf.Socket.Send(neighbor, pkt, SocketTimeout); err != nil {
-		return fmt.Errorf("failed to send rumor: %v", err)
+		n.logger.Error().Msgf("failed to send rumor: %v", err)
+		return nil
 	}
-	n.logger.Debug().Str("packet_id", pkt.Header.PacketID).Msgf("rumor is sent to %v", neighbor)
 
 	// wait for ack. If no ack, send to another neighbor
 	go func() {
@@ -606,17 +617,25 @@ func (n *node) download(hash string) (dataCh chan []byte, errCh chan error) {
 // This API is blocking, and calling it concurrently is undefined behavior.
 func (n *node) Tag(name string, mh string) error {
 	namingStore := n.conf.Storage.GetNamingStore()
+	if n.conf.TotalPeers <= 1 {
+		namingStore.Set(name, []byte(mh))
+		return nil
+	}
+
+	paxos := types.PaxosValue{
+		UniqID:   xid.New().String(),
+		Filename: name,
+		Metahash: mh,
+	}
+	n.logger.Info().Msgf("TAGGING begins, value: %v", paxos)
+
 	for {
 		if namingStore.Get(name) != nil {
 			n.logger.Error().Msgf("name already exists: %v", name)
 			return fmt.Errorf("name already exists")
 		}
 
-		value, err := n.multiPaxos.PrepareAndPropose(types.PaxosValue{
-			UniqID:   xid.New().String(),
-			Filename: name,
-			Metahash: mh,
-		})
+		value, err := n.multiPaxos.PrepareAndPropose(paxos)
 
 		if err != nil {
 			n.logger.Error().Msgf("failed to prepare and propose: %v", err)
@@ -627,6 +646,8 @@ func (n *node) Tag(name string, mh string) error {
 			n.logger.Info().Msgf("tagged: %v", name)
 			return nil
 		}
+
+		n.logger.Info().Msgf("retrying TAG, value: %v, acceptedValue: %v", paxos, value)
 	}
 }
 

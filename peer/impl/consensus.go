@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/sasha-s/go-deadlock"
@@ -299,6 +298,10 @@ func newPaxosInstance(n *node, step uint, conf peer.Configuration, doneCh <-chan
 	return p, a
 }
 
+type promiseChMsg struct {
+	acceptedID    uint
+	acceptedValue *types.PaxosValue
+}
 type Proposer struct {
 	*node
 
@@ -310,7 +313,7 @@ type Proposer struct {
 	currID uint
 
 	mu          deadlock.Mutex
-	promiseCh   chan struct{}
+	promiseCh   chan promiseChMsg
 	acceptCnt   map[string]int
 	consensusCh chan struct{}
 
@@ -325,11 +328,18 @@ func (p *Proposer) prepareAndPropose(value types.PaxosValue) error {
 	consensusCh := p.consensusCh
 	p.mu.Unlock()
 	for {
-		if err := p.prepare(); err != nil {
+		acceptedValue, err := p.prepare()
+		if err != nil {
 			return err
 		}
 
-		if err := p.propose(value); err != nil {
+		if acceptedValue != nil {
+			err = p.propose(*acceptedValue)
+		} else {
+			err = p.propose(value)
+		}
+
+		if err != nil {
 			return err
 		}
 
@@ -349,60 +359,73 @@ func (p *Proposer) prepareAndPropose(value types.PaxosValue) error {
 	}
 }
 
-// prepare until threshold promises are collected
-func (p *Proposer) prepare() error {
+// prepare until threshold promises are collected OR accept observed
+func (p *Proposer) prepare() (*types.PaxosValue, error) {
 	p.mu.Lock()
 	prepare := types.PaxosPrepareMessage{
 		Step:   p.step,
 		ID:     p.currID,
 		Source: p.getAddr(),
 	}
-	promiseCh := make(chan struct{}, p.threshold)
+	promiseCh := make(chan promiseChMsg, p.threshold)
 	p.promiseCh = promiseCh
 	p.mu.Unlock()
+	p.logger.Trace().Msgf("begin to prepare %v %v", prepare.Step, prepare.ID)
 
 	msg := *p.getMarshalledMsg(prepare)
 	if err := p.Broadcast(msg); err != nil {
 		p.logger.Error().Err(err).Msg("failed to broadcast prepare")
-		return err
+		return nil, nil
 	}
 
-	for !p.collectPromises(promiseCh) {
+	for {
+		b, acceptedValue := p.collectPromises(promiseCh)
+		if b {
+			return acceptedValue, nil
+		}
+		p.logger.Trace().Msgf("retry prepare, step %v", prepare.Step)
+
+		// early exit
 		select {
 		case <-p.ctx.Done():
-			return nil
+			return nil, nil
 		case <-p.doneCh:
-			return nil
+			return nil, nil
 		default:
 		}
-		p.logger.Trace().Msg("retry prepare")
+
 		p.mu.Lock()
 		p.currID += p.totalPeers
 		prepare.ID = p.currID
-		promiseCh = make(chan struct{}, p.threshold)
+		promiseCh = make(chan promiseChMsg, p.threshold)
 		p.promiseCh = promiseCh
 		p.mu.Unlock()
 		msg := *p.getMarshalledMsg(prepare)
 		if err := p.Broadcast(msg); err != nil {
 			p.logger.Error().Err(err).Msg("failed to broadcast prepare")
-			return err
+			return nil, err
 		}
 	}
-	return nil
 }
 
-func (p *Proposer) collectPromises(ch <-chan struct{}) bool {
+func (p *Proposer) collectPromises(ch <-chan promiseChMsg) (bool, *types.PaxosValue) {
 	done := make(chan struct{})
 	cancel := make(chan struct{})
-	 var cnt int32
+
+	var acceptedID uint
+	var acceptedValue *types.PaxosValue
+
 	go func() {
 		// collect threshold promises
 		for i := 0; i < p.threshold; i++ {
 			select {
 			case <-cancel:
 				return
-			case <-ch:
-			atomic.AddInt32(&cnt, 1)
+			case msg := <-ch:
+				if msg.acceptedID > acceptedID {
+					acceptedID = msg.acceptedID
+					acceptedValue = msg.acceptedValue
+				}
 			}
 		}
 		close(done)
@@ -411,11 +434,11 @@ func (p *Proposer) collectPromises(ch <-chan struct{}) bool {
 	select {
 	case <-done:
 		p.logger.Trace().Msg("collected threshold promises")
-		return true
+		return true, acceptedValue
 	case <-time.After(p.retry):
 		close(cancel)
-		p.logger.Trace().Msgf("promises not enough, collected %v/%v", atomic.LoadInt32(&cnt), p.threshold)
-		return false
+		p.logger.Trace().Msg("promises not enough")
+		return false, nil
 	}
 }
 
@@ -454,13 +477,18 @@ func (p *Proposer) promiseHandler(m types.Message, pkt transport.Packet) error {
 	}
 
 	select {
-	case p.promiseCh <- struct{}{}:
+	case p.promiseCh <- struct {
+		acceptedID    uint
+		acceptedValue *types.PaxosValue
+	}{promise.AcceptedID, promise.AcceptedValue}:
 	default:
+		// not collecting promises
 	}
 
 	return nil
 }
 
+// Note: If the node didn't propose, it should also collect accepts.
 func (p *Proposer) acceptHandler(m types.Message, pkt transport.Packet) (decided *types.PaxosValue, err error) {
 	accept := m.(*types.PaxosAcceptMessage)
 
@@ -474,11 +502,6 @@ func (p *Proposer) acceptHandler(m types.Message, pkt transport.Packet) (decided
 		p.logger.Info().Msgf("TLC step mismatch: from %s, step %d, currStep %d", pkt.Header.Source, accept.Step, step)
 		return nil, nil
 	}
-	// Note: If the node didn't propose, it will learn the result from TLC message.
-	// if !p.proposing {
-	// 	p.logger.Info().Msgf("Not proposing")
-	// 	return nil, nil
-	// }
 
 	p.acceptCnt[accept.Value.UniqID]++
 	p.logger.Trace().Msgf("Accepted %d times", p.acceptCnt[accept.Value.UniqID])
